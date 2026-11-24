@@ -349,9 +349,11 @@ function nativeTarget(bridge: EvenAppBridge): GlassesTarget {
     const first = prevSig === null
     const ok = await sendPage(view, menu, first)
     if (!ok) {
-      // The page is invalid; retrying the same payload every render would only
-      // repeat the error. Remember the signature so the next change retries.
-      prevSig = sig
+      // Nothing was drawn. Forget the signature: the next render must send the
+      // page again instead of upgrading containers of a page the host does not
+      // have (that left the old screen on the glasses forever).
+      prevSig = null
+      prevTexts = {}
       return
     }
 
@@ -467,20 +469,28 @@ function browserTarget(): GlassesTarget {
 }
 
 /**
- * Official boot path: waitForEvenAppBridge() resolves only inside the Even App
- * WebView (it waits for the evenAppBridgeReady event). Outside it the promise
- * never settles, so the race with a timeout is what tells the two apart.
+ * Official boot path: `waitForEvenAppBridge()` resolves inside the Even App
+ * WebView once the host is ready (it waits for the `evenAppBridgeReady` event).
+ *
+ * The waiting policy differs by host. Inside the Even App the bridge is
+ * guaranteed to appear, so we wait for it instead of giving up after a timeout —
+ * a cold WebView used to fall into the browser stub, leaving the glasses blank.
+ * In a plain browser the bridge never appears, so a short probe is enough.
  */
 export async function createTarget(): Promise<GlassesTarget> {
   if (typeof window !== 'undefined') {
-    const timeout = new Promise<null>((resolve) => {
-      window.setTimeout(() => resolve(null), 1500)
-    })
-    const bridge = await Promise.race([
-      waitForEvenAppBridge().catch(() => null),
-      timeout,
-    ])
+    const inEvenApp = 'flutter_inappwebview' in window
+    const probe = inEvenApp
+      ? waitForEvenAppBridge().catch(() => null)
+      : Promise.race([
+          waitForEvenAppBridge().catch(() => null),
+          new Promise<null>((resolve) => {
+            window.setTimeout(() => resolve(null), 800)
+          }),
+        ])
+    const bridge = await probe
     if (bridge) return nativeTarget(bridge)
+    if (inEvenApp) console.error('[teleglass] Even App WebView without a bridge')
   }
   return browserTarget()
 }

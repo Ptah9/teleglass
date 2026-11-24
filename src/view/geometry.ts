@@ -1,8 +1,9 @@
+import { TEXT_PX } from '../state/wrap'
+
 /**
  * 576×288 screen geometry — design-system.md §3, refined by measurements.
  *
- * One font, 20 px, 20 px margins. All coordinates come from the ux-flow.md map
- * (FULL TEXT: 512 px text area, rail and slider on the right).
+ * One font, 20 px, 20 px margins. All coordinates come from the ux-flow.md map.
  *
  * MEASURED in the 0.9.5 simulator via framebuffer (it used to be computed from
  * the guideline and did not match — that is what produced bugs 1–6):
@@ -13,16 +14,13 @@
  *   the container only sets the visible window.
  */
 
-export const SCREEN_W = 576
-export const SCREEN_H = 288
-/** Height of one text line in the firmware (measured). */
-export const TEXT_LINE = 27
+/** Height of one text line in the firmware (measured). */export const TEXT_LINE = 27
 /** Native list row height (measured, not configurable). */
 export const LIST_ROW = 40
 /** Content margins. */
 export const MARGIN = 20
-/** Working width: 576 − 2×20. */
-export const CONTENT_W = 536
+/** Working width: 576 − 2×20, the same number the text measurement uses. */
+export const CONTENT_W = TEXT_PX
 
 export interface Rect {
   readonly x: number

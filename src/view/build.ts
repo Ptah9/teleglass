@@ -2,6 +2,8 @@ import type { TFunc } from '../i18n'
 import { chatById, chatLabel, unreadMsgs, visibleChats } from '../state/reducer'
 import type { AppState } from '../state/types'
 import { clipLines, lineCount } from '../state/wrap'
+import * as LINES from '../state/limits'
+import { stamp } from './stamp'
 import { BORDER, LIST_ROWS, LIST_ROW, LVL, SLOT } from './geometry'
 
 /**
@@ -45,10 +47,9 @@ export interface View {
   readonly list?: ViewList
 }
 
-/** Body lines on CHAT/HEARD: 5 lines of 27 px fit into 144 px (measured). */
-const BODY_LINES = 5
-/** Summary is up to 4 lines + caption (i18n-strings.md §5). */
-const SUMMARY_LINES = 4
+/** Shared with the logic so the footer hint and the gesture cannot disagree. */
+const BODY_LINES = LINES.BODY_LINES
+const SUMMARY_LINES = LINES.SUMMARY_LINES
 
 /**
  * LISTENING indicator: the official block ramp (design-guidelines § Glyphs).
@@ -56,7 +57,7 @@ const SUMMARY_LINES = 4
  */
 const WAVE = '▁▂▃▄▅▆▇█'
 /** 26 blocks × 20 px = 520 px — the whole 536 px working width (measured). */
-const WAVE_LEN = 26
+const WAVE_LEN = LINES.WAVE_LEN
 
 /** Microphone levels → the block ramp. Silence pads the left side. */
 function waveOf(levels: readonly number[]): string {
@@ -157,12 +158,14 @@ function chatsView(s: AppState, t: TFunc): View {
     : t('chats.hint')
 
   if (visible.length === 0) {
+    // ux-flow: an empty list has nothing to open, so the footer offers the only
+    // action that exists — checking again.
     const texts = textsOf([
       { id: 'title', slot: 'title', content: t('idle.title'), level: LVL.main },
       dividerSpec('divider'),
       { id: 'body', slot: 'body', content: t('idle.empty'), level: LVL.body, capture: true },
       { id: 'sub', slot: 'sub', content: t('idle.stamp', { time: s.lastChecked }), level: LVL.caption },
-      { id: 'footer', slot: 'footer', content: footer, level: LVL.caption },
+      { id: 'footer', slot: 'footer', content: t('idle.hint'), level: LVL.caption },
     ])
     return { shape: shapeOf(texts), texts }
   }
@@ -176,13 +179,11 @@ function chatsView(s: AppState, t: TFunc): View {
   // Telegram shows it; while sending — "· sending…".
   const items = visible.map((c) => {
     const last = c.messages[c.messages.length - 1]
-    const base = last
-      ? t('chats.row', {
-          chat: chatLabel(c).toUpperCase(),
-          time: last.at,
-          n: unreadMsgs(c, s.read).length,
-        })
-      : `${chatLabel(c).toUpperCase()} (${unreadMsgs(c, s.read).length})`
+    const base = t('chats.row', {
+      chat: chatLabel(c).toUpperCase(),
+      time: last ? stamp(last.at, s.lang) : '—',
+      n: unreadMsgs(c, s.read).length,
+    })
     return s.sendingRow === c.id ? `${base} · ${t('chats.sending')}` : base
   })
 
@@ -221,9 +222,12 @@ function chatView(s: AppState, t: TFunc): View {
     total: msgs.length,
   })}`
 
-  // One gesture, two meanings: long message → summary, short one → in full.
-  // "Long" is the official pixel count of lines, not a character guess.
-  const isSummary = msg.summary !== undefined && lineCount(msg.text) > BODY_LINES
+  // One gesture, two meanings: long message → full text, short one → skip.
+  // "Long" is the measured pixel height, not whether a summary happens to exist:
+  // a long message without a summary is clipped with "…" on CHAT but the full
+  // text must still be reachable.
+  const isLong = lineCount(msg.text) > BODY_LINES
+  const isSummary = isLong && msg.summary !== undefined
 
   const body = isSummary
     ? clipLines(msg.summary ?? '', SUMMARY_LINES)
@@ -239,14 +243,14 @@ function chatView(s: AppState, t: TFunc): View {
     id: 'sub',
     slot: 'sub',
     content: isSummary
-      ? t('chat.metaBadge', { time: msg.at, badge: t('chat.summaryBadge') })
-      : t('chat.meta', { time: msg.at }),
+      ? t('chat.metaBadge', { time: stamp(msg.at, s.lang), badge: t('chat.summaryBadge') })
+      : t('chat.meta', { time: stamp(msg.at, s.lang) }),
     level: LVL.caption,
   })
   specs.push({
     id: 'footer',
     slot: 'footer',
-    content: isSummary ? t('chat.hint.long') : t('chat.hint.short'),
+    content: isLong ? t('chat.hint.long') : t('chat.hint.short'),
     level: LVL.caption,
   })
 
@@ -280,7 +284,7 @@ function fulltextView(s: AppState, t: TFunc): View {
     {
       id: 'title',
       slot: 'title',
-      content: t('fulltext.title', { chat: chatLabel(chat).toUpperCase(), time: msg.at }),
+      content: t('fulltext.title', { chat: chatLabel(chat).toUpperCase(), time: stamp(msg.at, s.lang) }),
       level: LVL.main,
     },
     dividerSpec('divider'),

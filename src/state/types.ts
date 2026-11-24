@@ -60,8 +60,15 @@ export type Screen =
   | { kind: 'chatEmpty'; chatId: string }
   | { kind: 'fulltext'; chatId: string; msgIndex: number }
   | { kind: 'replies'; chatId: string; msgIndex: number; sel: number }
-  | { kind: 'repliesEmpty'; chatId: string }
-  | { kind: 'confirm'; chatId: string; msgIndex: number; reply: string }
+  | { kind: 'repliesEmpty'; chatId: string; msgIndex: number }
+  | {
+      kind: 'confirm'
+      chatId: string
+      msgIndex: number
+      reply: string
+      /** "No" goes back where the reply came from: the options or the transcript. */
+      from: 'replies' | 'heard'
+    }
   | { kind: 'quickConfirm'; chatId: string }
   | {
       kind: 'skipConfirm'

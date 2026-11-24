@@ -7,6 +7,7 @@ import {
 } from './data'
 import type { AppEvent, AppState, Gesture, MockChat, MockMessage } from './types'
 import { lineCount } from './wrap'
+import * as LINES from './limits'
 /**
  * Reducer: all transition logic, verbatim from the ux-flow.md gesture table.
  *
@@ -20,10 +21,10 @@ import { lineCount } from './wrap'
  * to draw.
  */
 
-/** How many body lines fit on CHAT: 5 lines of 27 px (measured on 0.9.5). */
-const BODY_LINES = 5
-/** Indicator columns kept in state: 26 blocks × 20 px = 520 px (build.ts WAVE_LEN). */
-const WAVE_LEN = 26
+/** How many body lines fit on CHAT (shared with the view). */
+const BODY_LINES = LINES.BODY_LINES
+/** Indicator columns kept in state (shared with the view). */
+const WAVE_LEN = LINES.WAVE_LEN
 /** Mock "sending to Telegram" delay. */
 const SEND_MS = 1500
 /** A recording shorter than 0.8 s counts as failed (demo rule for HEARD "did not catch it"). */
@@ -96,7 +97,9 @@ function markMessageRead(s: AppState, chatId: string, msgIndex: number): Record<
 }
 
 function isLongMessage(msg: MockMessage): boolean {
-  return msg.summary !== undefined && lineCount(msg.text) > BODY_LINES
+  // Length only: a summary may be missing (LLM not ready, chat without summaries),
+  // and the full text must stay reachable anyway.
+  return lineCount(msg.text) > BODY_LINES
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +173,7 @@ function onChats(s: AppState, g: Gesture): AppState {
     case 'click': {
       // Empty: tap = "check again" (idle.hint).
       if (visible.length === 0) return checkAgain(s)
-      return openChat(s, s.selChat)
+      return openChat(s, clampSel(s, visible.length))
     }
     case 'doubleClick':
       // Root page: intercepted in page.ts, which calls
@@ -199,7 +202,7 @@ function onChats(s: AppState, g: Gesture): AppState {
       }
       // Normal case: quick reply into the selected chat.
       if (visible.length === 0) return s
-      const chat = visible[s.selChat] ?? visible[0]
+      const chat = visible[clampSel(s, visible.length)]
       if (!chat) return s
       return { ...s, screen: { kind: 'quickConfirm', chatId: chat.id } }
     }
@@ -217,8 +220,16 @@ function onChats(s: AppState, g: Gesture): AppState {
   }
 }
 
-function checkAgain(s: AppState): AppState {
-  const now = timeStr()
+/**
+ * Our copy of the native highlight can point past the end after a chat leaves
+ * the list; the firmware always has a row selected, so we clamp instead of
+ * falling back to the first chat (that sent quick replies to the wrong person).
+ */
+function clampSel(s: AppState, length: number): number {
+  return Math.min(Math.max(s.selChat, 0), length - 1)
+}
+
+function checkAgain(s: AppState): AppState {  const now = timeStr()
   const [head, ...rest] = s.inboxQueue
   if (!head) return { ...s, lastChecked: now }
   const chats = s.chats.map((c) =>
@@ -325,7 +336,7 @@ function toReplies(s: AppState, chatId: string, msgIndex: number): AppState {
   const msg = unreadMsgs(chat, s.read)[msgIndex]
   if (!msg) return s
   if (msg.replies.length === 0) {
-    return { ...s, screen: { kind: 'repliesEmpty', chatId } }
+    return { ...s, screen: { kind: 'repliesEmpty', chatId, msgIndex } }
   }
   return { ...s, screen: { kind: 'replies', chatId, msgIndex, sel: 0 } }
 }
@@ -374,8 +385,9 @@ function onRepliesEmpty(s: AppState, g: Gesture): AppState {
   const scr = s.screen
   if (scr.kind !== 'repliesEmpty') return s
   // ux-flow: double tap — back to CHAT; the footer still promises swipe ↑ back.
+  // Back to the message we came from, not to the first one in the queue.
   if (g === 'doubleClick' || g === 'swipeUp') {
-    return { ...s, screen: { kind: 'chat', chatId: scr.chatId, msgIndex: 0 } }
+    return { ...s, screen: { kind: 'chat', chatId: scr.chatId, msgIndex: scr.msgIndex } }
   }
   return s
 }
@@ -402,7 +414,20 @@ function onConfirm(s: AppState, g: Gesture): AppState {
       }
     case 'doubleClick':
     case 'swipeUp':
-      // "No" — back to the options.
+      // "No" — back where the reply came from: the transcript must not be lost
+      // because someone changed their mind on the confirmation.
+      if (scr.from === 'heard') {
+        return {
+          ...s,
+          screen: {
+            kind: 'heard',
+            chatId: scr.chatId,
+            msgIndex: scr.msgIndex,
+            variant: s.phoneMic ? 'phoneMic' : 'ok',
+            text: scr.reply,
+          },
+        }
+      }
       return toReplies(s, scr.chatId, scr.msgIndex)
     default:
       return s
@@ -564,7 +589,13 @@ function onHeard(s: AppState, g: Gesture): AppState {
     case 'click':
       return {
         ...s,
-        screen: { kind: 'confirm', chatId: scr.chatId, msgIndex: scr.msgIndex, reply: scr.text },
+        screen: {
+          kind: 'confirm',
+          chatId: scr.chatId,
+          msgIndex: scr.msgIndex,
+          reply: scr.text,
+          from: 'heard',
+        },
       }
     case 'longPress':
       return startListeningAgain(s, 'hold')
@@ -656,7 +687,13 @@ function onListClick(s: AppState, index: number): AppState {
       if (reply === undefined) return s
       return {
         ...s,
-        screen: { kind: 'confirm', chatId: scr.chatId, msgIndex: scr.msgIndex, reply },
+        screen: {
+          kind: 'confirm',
+          chatId: scr.chatId,
+          msgIndex: scr.msgIndex,
+          reply,
+          from: 'replies',
+        },
       }
     }
     default:

@@ -6,12 +6,9 @@
   "idle.hint": "тап — проверить ещё раз",
   "chats.hint": "тап — открыть · удержание — быстрый ответ",
   "chats.row": "{chat} · {time} ({n})",
-  "chats.unread": "{n} новых",
   "chats.sending": "отправляю…",
   "chats.sent": "отправлено · {chat}",
   "chats.notSent": "не отправлено · удержание — ещё раз",
-  "message.hint.next": "свайп ↓ дальше · тап ответ",
-  "message.hint.prev": "свайп ↑ назад · тап ответ",
   "chat.hint.short": "тап — ответ · удержание — пропустить",
   "chat.hint.long": "тап — ответ · удержание — весь текст",
   "chat.summaryBadge": "кратко · удержание — весь текст",
@@ -58,7 +55,6 @@
   "demo.value.down": "выключен",
   "demo.value.glasses": "очки",
   "demo.value.phone": "телефон",
-  "dev.title": "Панель отладки",
   "dev.tap": "тап",
   "dev.double": "двойной тап",
   "dev.up": "свайп ↑",
@@ -72,5 +68,6 @@
   "dev.state": "состояние",
   "dev.mock": "браузер: кнопки ведут заглушку",
   "dev.native": "Even App: жесты идут с очков",
-  "dev.connecting": "подключаюсь к bridge…"
+  "dev.connecting": "подключаюсь к bridge…",
+  "dev.bootError": "Мост не запустился. Перезапустите приложение."
 }

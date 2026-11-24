@@ -6,12 +6,9 @@
   "idle.hint": "tap — check again",
   "chats.hint": "tap — open · hold — quick reply",
   "chats.row": "{chat} · {time} ({n})",
-  "chats.unread": "{n} unread",
   "chats.sending": "sending…",
   "chats.sent": "sent · {chat}",
   "chats.notSent": "not sent · hold to retry",
-  "message.hint.next": "swipe ↓ next · tap reply",
-  "message.hint.prev": "swipe ↑ back · tap reply",
   "chat.hint.short": "tap — reply · hold — skip",
   "chat.hint.long": "tap — reply · hold — full text",
   "chat.summaryBadge": "summary · hold for full text",
@@ -58,7 +55,6 @@
   "demo.value.down": "down",
   "demo.value.glasses": "glasses",
   "demo.value.phone": "phone",
-  "dev.title": "Dev panel",
   "dev.tap": "tap",
   "dev.double": "double tap",
   "dev.up": "swipe ↑",
@@ -72,5 +68,6 @@
   "dev.state": "state",
   "dev.mock": "browser: buttons drive the mock",
   "dev.native": "Even App: gestures come from the glasses",
-  "dev.connecting": "connecting to bridge…"
+  "dev.connecting": "connecting to bridge…",
+  "dev.bootError": "Bridge did not start. Restart the app."
 }

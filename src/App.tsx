@@ -21,6 +21,7 @@ interface LogEntry {
 export default function App() {
   const [state, setState] = useState<AppState | null>(null)
   const [native, setNative] = useState<boolean | null>(null)
+  const [bootFailed, setBootFailed] = useState(false)
   const [screens, setScreens] = useState<LogEntry[]>([])
   const pageRef = useRef<Page | null>(null)
   const lastKind = useRef('')
@@ -28,22 +29,31 @@ export default function App() {
 
   useEffect(() => {
     let alive = true
-    void getPage().then((page) => {
-      if (!alive) return
-      pageRef.current = page
-      setState(page.state())
-      setNative(page.native)
-      page.subscribe((s) => {
-        setState(s)
-        if (s.screen.kind !== lastKind.current) {
-          lastKind.current = s.screen.kind
-          const id = ++logSeq.current
-          setScreens((prev) => [{ id, kind: s.screen.kind }, ...prev].slice(0, 24))
-        }
+    let stop: (() => void) | undefined
+    getPage()
+      .then((page) => {
+        if (!alive) return
+        pageRef.current = page
+        setState(page.state())
+        setNative(page.native)
+        stop = page.subscribe((s) => {
+          setState(s)
+          if (s.screen.kind !== lastKind.current) {
+            lastKind.current = s.screen.kind
+            const id = ++logSeq.current
+            setScreens((prev) => [{ id, kind: s.screen.kind }, ...prev].slice(0, 24))
+          }
+        })
       })
-    })
+      .catch((err: unknown) => {
+        // Never leave the panel on "connecting…": a failed boot is a message,
+        // not a spinner (app-submission.md: no infinite spinner).
+        console.error('[teleglass] page failed to start:', err)
+        if (alive) setBootFailed(true)
+      })
     return () => {
       alive = false
+      stop?.()
     }
   }, [])
 
@@ -53,7 +63,7 @@ export default function App() {
   if (!state || !view) {
     return (
       <div className="app">
-        <p className="dim">{t('dev.connecting')}</p>
+        <p className="dim">{bootFailed ? t('dev.bootError') : t('dev.connecting')}</p>
       </div>
     )
   }
