@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.ehpk
+.env
+.env.*
+*.tsbuildinfo
+
+# Workshop notes, not part of the submission
+BUGS.md
+HANDOFF.md
