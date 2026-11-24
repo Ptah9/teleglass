@@ -1,2 +1,497 @@
-// Teleglass scaffold. Empty module: code arrives in the v0.1 commit.
-export {}
+import type { TFunc } from '../i18n'
+import { chatById, chatLabel, unreadMsgs, visibleChats } from '../state/reducer'
+import type { AppState } from '../state/types'
+import { clipLines, lineCount } from '../state/wrap'
+import { BORDER, LIST_ROWS, LIST_ROW, LVL, SLOT } from './geometry'
+
+/**
+ * Pure screen assembly: (state, dictionary) → set of containers.
+ * No SDK and no events — this module can be called from tests and from the
+ * browser preview alike.
+ *
+ * Redraw saving rule: `shape` describes the SET of containers.
+ * Same shape = update text only (textContainerUpgrade),
+ * different = full rebuild. The list changes only via rebuild —
+ * that is a firmware limitation, not our choice.
+ */
+
+export interface ViewText {
+  readonly id: string
+  readonly x: number
+  readonly y: number
+  readonly w: number
+  readonly h: number
+  readonly content: string
+  readonly level: 1 | 2 | 3 | 4
+  readonly border?: { width: number; color: number; radius: number }
+  /** Exactly one container per screen captures events. */
+  readonly capture?: boolean
+}
+
+export interface ViewList {
+  readonly id: 'list'
+  readonly x: number
+  readonly y: number
+  readonly w: number
+  readonly h: number
+  readonly items: string[]
+  readonly sel: number
+}
+
+export interface View {
+  /** container ids; identical → texts can be updated without rebuild. */
+  readonly shape: string
+  readonly texts: ViewText[]
+  readonly list?: ViewList
+}
+
+/** Body lines on CHAT/HEARD: 5 lines of 27 px fit into 144 px (measured). */
+const BODY_LINES = 5
+/** Summary is up to 4 lines + caption (i18n-strings.md §5). */
+const SUMMARY_LINES = 4
+
+/**
+ * LISTENING indicator: the official block ramp (design-guidelines § Glyphs).
+ * One column per SDK audio chunk, the newest on the right.
+ */
+const WAVE = '▁▂▃▄▅▆▇█'
+/** 26 blocks × 20 px = 520 px — the whole 536 px working width (measured). */
+const WAVE_LEN = 26
+
+/** Microphone levels → the block ramp. Silence pads the left side. */
+function waveOf(levels: readonly number[]): string {
+  const tail = levels
+    .slice(-WAVE_LEN)
+    .map((l) => WAVE[Math.min(7, Math.max(0, Math.round(l * 7)))] ?? WAVE[0]!)
+    .join('')
+  return (WAVE[0] ?? '').repeat(WAVE_LEN - tail.length) + tail
+}
+
+/** Text without coordinates: the slot fills them in. */
+type TextSpec = Omit<ViewText, 'x' | 'y' | 'w' | 'h'> & { slot?: string }
+
+function at(slot: string, spec: TextSpec): ViewText {
+  const r = SLOT[slot] ?? SLOT.body
+  return { ...spec, x: r.x, y: r.y, w: r.w, h: r.h }
+}
+
+function textsOf(specs: TextSpec[]): ViewText[] {
+  return specs.map((spec) => at(spec.slot ?? 'body', spec))
+}
+
+/**
+ * List window. The firmware centers the row block inside the window (measured:
+ * 3 rows in 160 px → 20 px above and below), so "window over all free space"
+ * with an incomplete list leaves black bands around the rows. Rule: rows go down
+ * from the divider, window height = min(rows, visible rows) × 40.
+ */
+function listRect(count: number): { x: number; y: number; w: number; h: number } {
+  const h = Math.min(count, LIST_ROWS) * LIST_ROW
+  return { x: SLOT.body.x, y: SLOT.body.y, w: SLOT.body.w, h }
+}
+
+/**
+ * Divider — a 1 px container with a border, not a "─" string: on a text line the
+ * firmware wraps the 46th char and draws a false scrollbar on the right
+ * (measured: 4×10 px at x546). Same container count — the text in it is empty.
+ */
+function dividerSpec(id: 'divider' | 'divider2'): TextSpec {
+  return {
+    id,
+    slot: id,
+    content: '',
+    level: LVL.divider,
+    border: { width: 1, color: BORDER.divider, radius: 0 },
+  }
+}
+
+function shapeOf(texts: ViewText[], list?: ViewList): string {
+  return texts.map((x) => x.id).join('+') + (list ? '+list' : '')
+}
+
+export function buildView(s: AppState, t: TFunc): View {
+  switch (s.screen.kind) {
+    case 'chats':
+      return chatsView(s, t)
+    case 'chat':
+      return chatView(s, t)
+    case 'chatEmpty':
+      return chatEmptyView(s, t, s.screen.chatId)
+    case 'fulltext':
+      return fulltextView(s, t)
+    case 'replies':
+      return repliesView(s, t)
+    case 'repliesEmpty':
+      return repliesEmptyView(s, t)
+    case 'confirm':
+      return confirmView(s, t)
+    case 'quickConfirm':
+      return quickConfirmView(s, t)
+    case 'skipConfirm':
+      return skipConfirmView(s, t)
+    case 'sending':
+      return sendingView(s, t)
+    case 'sent':
+      return sentView(s, t)
+    case 'offline':
+      return offlineView(s, t)
+    case 'listening':
+      return listeningView(s, t)
+    case 'heard':
+      return heardView(s, t)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CHATS.
+// ---------------------------------------------------------------------------
+
+function chatsView(s: AppState, t: TFunc): View {
+  const visible = visibleChats(s)
+
+  // The CHATS footer changes with the quick reply state: normal, sent (2 s), not sent.
+  const footer = s.flash
+    ? s.flash.key === 'sent'
+      ? t('chats.sent', { chat: s.flash.person })
+      : t('chats.notSent')
+    : t('chats.hint')
+
+  if (visible.length === 0) {
+    const texts = textsOf([
+      { id: 'title', slot: 'title', content: t('idle.title'), level: LVL.main },
+      dividerSpec('divider'),
+      { id: 'body', slot: 'body', content: t('idle.empty'), level: LVL.body, capture: true },
+      { id: 'sub', slot: 'sub', content: t('idle.stamp', { time: s.lastChecked }), level: LVL.caption },
+      { id: 'footer', slot: 'footer', content: footer, level: LVL.caption },
+    ])
+    return { shape: shapeOf(texts), texts }
+  }
+
+  // List window: rows are fixed by the firmware (40 px), the window is a whole
+  // number of rows. That way the firmware clips and pages the list neatly on its
+  // own; a window that is not a multiple of 40 (e.g. 182 px) lets a partial row
+  // spill onto the footer (measured).
+  // Chat row: "IVAN · PROJECT · 19:31 (3)" — the counter in (n) format
+  // (ux-flow, «Что макет добавил сам» №1), the time of the last message like
+  // Telegram shows it; while sending — "· sending…".
+  const items = visible.map((c) => {
+    const last = c.messages[c.messages.length - 1]
+    const base = last
+      ? t('chats.row', {
+          chat: chatLabel(c).toUpperCase(),
+          time: last.at,
+          n: unreadMsgs(c, s.read).length,
+        })
+      : `${chatLabel(c).toUpperCase()} (${unreadMsgs(c, s.read).length})`
+    return s.sendingRow === c.id ? `${base} · ${t('chats.sending')}` : base
+  })
+
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('idle.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'footer', slot: 'footer', content: footer, level: LVL.caption },
+  ])
+  const list: ViewList = {
+    id: 'list',
+    ...listRect(items.length),
+    items,
+    // Selection is an index in the full list: the firmware pages the list and
+    // keeps the highlight on a visible row.
+    sel: Math.min(Math.max(s.selChat, 0), items.length - 1),
+  }
+  return { shape: shapeOf(texts, list), texts, list }
+}
+
+// ---------------------------------------------------------------------------
+// CHAT, empty CHAT, FULL TEXT.
+// ---------------------------------------------------------------------------
+
+function chatView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'chat') return chatsView(s, t)
+  const chat = chatById(s, scr.chatId)
+  if (!chat) return chatsView(s, t)
+  const msgs = unreadMsgs(chat, s.read)
+  const msg = msgs[scr.msgIndex]
+  if (!msg) return chatEmptyView(s, t, scr.chatId)
+
+  // The counter is in the header, not the footer: the footer is taken by gestures (ux-flow § Жесты).
+  const header = `${chatLabel(chat).toUpperCase()} · ${t('page.counter', {
+    page: scr.msgIndex + 1,
+    total: msgs.length,
+  })}`
+
+  // One gesture, two meanings: long message → summary, short one → in full.
+  // "Long" is the official pixel count of lines, not a character guess.
+  const isSummary = msg.summary !== undefined && lineCount(msg.text) > BODY_LINES
+
+  const body = isSummary
+    ? clipLines(msg.summary ?? '', SUMMARY_LINES)
+    : clipLines(msg.text, BODY_LINES)
+
+  const specs: TextSpec[] = [
+    { id: 'title', slot: 'title', content: header, level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: body, level: LVL.body, capture: true },
+  ]
+  // When the message arrived, always: a summary also carries its badge here.
+  specs.push({
+    id: 'sub',
+    slot: 'sub',
+    content: isSummary
+      ? t('chat.metaBadge', { time: msg.at, badge: t('chat.summaryBadge') })
+      : t('chat.meta', { time: msg.at }),
+    level: LVL.caption,
+  })
+  specs.push({
+    id: 'footer',
+    slot: 'footer',
+    content: isSummary ? t('chat.hint.long') : t('chat.hint.short'),
+    level: LVL.caption,
+  })
+
+  const texts = textsOf(specs)
+  return { shape: shapeOf(texts), texts }
+}
+
+function chatEmptyView(s: AppState, t: TFunc, chatId: string): View {
+  const chat = chatById(s, chatId)
+  const header = chat ? chatLabel(chat).toUpperCase() : t('idle.title')
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: header, level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: t('chat.empty'), level: LVL.body, capture: true },
+    { id: 'footer', slot: 'footer', content: t('chat.emptyHint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function fulltextView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'fulltext') return chatsView(s, t)
+  const chat = chatById(s, scr.chatId)
+  if (!chat) return chatsView(s, t)
+  const msg = unreadMsgs(chat, s.read)[scr.msgIndex]
+  if (!msg) return chatsView(s, t)
+
+  // The whole message goes to the body: it is event-capturing, so the firmware
+  // scrolls overflowing text and draws its own scrollbar (no custom rail/slider).
+  const texts = textsOf([
+    {
+      id: 'title',
+      slot: 'title',
+      content: t('fulltext.title', { chat: chatLabel(chat).toUpperCase(), time: msg.at }),
+      level: LVL.main,
+    },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: msg.text, level: LVL.body, capture: true },
+    { id: 'footer', slot: 'footer', content: t('fulltext.hint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+// ---------------------------------------------------------------------------
+// REPLIES.
+// ---------------------------------------------------------------------------
+
+function repliesView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'replies') return repliesEmptyView(s, t)
+  const chat = chatById(s, scr.chatId)
+  const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
+  if (!msg || msg.replies.length === 0) return repliesEmptyView(s, t)
+
+  // "Say it" is the mandatory second way into voice (design-system.md §5.1):
+  // the OS may take the long press for its own menu, the tap always remains.
+  const items = [...msg.replies, t('options.sayIt')]
+
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('options.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'footer', slot: 'footer', content: t('options.hint'), level: LVL.caption },
+  ])
+  const list: ViewList = {
+    id: 'list',
+    ...listRect(items.length),
+    items,
+    // The selection is clamped to the visible window: the highlight must not leave the list.
+    sel: Math.min(Math.max(scr.sel, 0), Math.min(items.length, LIST_ROWS) - 1),
+  }
+  return { shape: shapeOf(texts, list), texts, list }
+}
+
+function repliesEmptyView(_s: AppState, t: TFunc): View {
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('replies.emptyTitle'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: ' ', level: LVL.body, capture: true },
+    { id: 'footer', slot: 'footer', content: t('replies.emptyHint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+// ---------------------------------------------------------------------------
+// Confirmations and the send result: one composition of 5 containers,
+// only the text changes — SEND? → SENDING → SENT go without rebuild.
+// ---------------------------------------------------------------------------
+
+function confirmView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'confirm') return chatsView(s, t)
+  const chat = chatById(s, scr.chatId)
+  const to = chat ? t('confirm.to', { chat: chatLabel(chat) }) : ''
+  // The reply is quoted in full: long ones overflow and the firmware scrolls them.
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('confirm.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: `"${scr.reply}"`, level: LVL.body, capture: true },
+    { id: 'sub', slot: 'sub', content: to, level: LVL.caption },
+    { id: 'footer', slot: 'footer', content: t('confirm.hint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function quickConfirmView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'quickConfirm') return chatsView(s, t)
+  const chat = chatById(s, scr.chatId)
+  const n = chat ? unreadMsgs(chat, s.read).length : 0
+  const to = chat ? t('quickReply.to', { chat: chatLabel(chat), n }) : ''
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('quickReply.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: `"${s.quickReplyText}"`, level: LVL.body, capture: true },
+    { id: 'sub', slot: 'sub', content: to, level: LVL.caption },
+    { id: 'footer', slot: 'footer', content: t('quickReply.hint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function skipConfirmView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'skipConfirm') return chatsView(s, t)
+  const chat = chatById(s, scr.chatId)
+  const msgs = chat ? unreadMsgs(chat, s.read) : []
+  const meta = chat
+    ? t('skip.meta', {
+        chat: chatLabel(chat).toUpperCase(),
+        page: Math.min(scr.msgIndex + 1, msgs.length),
+        total: msgs.length,
+      })
+    : ''
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('skip.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: t('skip.body'), level: LVL.body, capture: true },
+    { id: 'sub', slot: 'sub', content: meta, level: LVL.caption },
+    { id: 'footer', slot: 'footer', content: t('skip.hint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function sendingView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'sending') return chatsView(s, t)
+  const isQuick = scr.mode === 'quick'
+  const texts = textsOf([
+    {
+      id: 'title',
+      slot: 'title',
+      content: isQuick ? t('quickReply.title') : t('confirm.title'),
+      level: LVL.main,
+    },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: `"${scr.reply}"`, level: LVL.body, capture: true },
+    // Footer without actions — "waiting, no gestures" (ux-flow, SENDING).
+    { id: 'sub', slot: 'sub', content: t('chats.sending'), level: LVL.caption },
+    { id: 'footer', slot: 'footer', content: '', level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function sentView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'sent') return chatsView(s, t)
+  const chat = chatById(s, scr.chatId)
+  const stamp = chat ? `${scr.at} · ${chat.person}` : scr.at
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('sent.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: `"${scr.reply}"`, level: LVL.body, capture: true },
+    { id: 'sub', slot: 'sub', content: stamp, level: LVL.caption },
+    { id: 'footer', slot: 'footer', content: t('sent.hint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function offlineView(_s: AppState, t: TFunc): View {
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('error.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: t('error.body'), level: LVL.body, capture: true },
+    { id: 'sub', slot: 'sub', content: t('error.sub'), level: LVL.caption },
+    { id: 'footer', slot: 'footer', content: t('error.hint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+// ---------------------------------------------------------------------------
+// Voice.
+// ---------------------------------------------------------------------------
+
+function listeningView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'listening') return chatsView(s, t)
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('voice.listening.title'), level: LVL.main },
+    dividerSpec('divider'),
+    {
+      id: 'indicator',
+      slot: 'indicator',
+      content: waveOf(scr.levels),
+      level: LVL.main,
+      capture: true,
+    },
+    dividerSpec('divider2'),
+    {
+      id: 'footer',
+      slot: 'footer',
+      content: scr.mode === 'hold' ? t('voice.listening.hint') : t('voice.listening.hintTap'),
+      level: LVL.caption,
+    },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function heardView(s: AppState, t: TFunc): View {
+  const scr = s.screen
+  if (scr.kind !== 'heard') return chatsView(s, t)
+
+  if (scr.variant === 'error') {
+    const texts = textsOf([
+      { id: 'title', slot: 'title', content: t('voice.heard.title'), level: LVL.main },
+      dividerSpec('divider'),
+      { id: 'body', slot: 'body', content: t('voice.error.body'), level: LVL.body, capture: true },
+      { id: 'sub', slot: 'sub', content: '', level: LVL.caption },
+      { id: 'footer', slot: 'footer', content: t('voice.heard.errorHint'), level: LVL.caption },
+    ])
+    return { shape: shapeOf(texts), texts }
+  }
+
+  // The transcript is handed to the firmware as is: the body is event-capturing,
+  // so the firmware scrolls overflowing text itself and draws its own scrollbar.
+  // Our own rail/slider is not needed (and would duplicate the stock one).
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('voice.heard.title'), level: LVL.main },
+    dividerSpec('divider'),
+    { id: 'body', slot: 'body', content: scr.text, level: LVL.body, capture: true },
+    {
+      id: 'sub',
+      slot: 'sub',
+      content: scr.variant === 'phoneMic' ? t('voice.heard.phoneMic') : '',
+      level: LVL.caption,
+    },
+    { id: 'footer', slot: 'footer', content: t('voice.heard.hint'), level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}

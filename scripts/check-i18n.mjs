@@ -6,73 +6,31 @@
  * 1. en and ru carry the same set of keys;
  * 2. both strings carry the same set of {name} arguments;
  * 3. braces are balanced;
- * 4. a string is not longer than the budget of its key (characters, not bytes);
+ * 4. a string fits one line of its container, measured with the official
+ *    `@evenrealities/pretext` (the same LVGL metrics the firmware uses);
  * 5. a context-menu item name is ≤ 32 bytes UTF-8 (firmware limit).
  */
 
 import { readFileSync } from 'node:fs'
+import { getTextWidth } from '@evenrealities/pretext'
 
 const en = JSON.parse(readFileSync(new URL('../src/i18n/en.json', import.meta.url), 'utf8'))
 const ru = JSON.parse(readFileSync(new URL('../src/i18n/ru.json', import.meta.url), 'utf8'))
 
-/** Length budgets — the "Limit" column of i18n-strings.md §6, in characters. */
-const LIMITS = {
-  'app.name': 11,
-  'idle.title': 20,
-  'idle.empty': 50,
-  'idle.stamp': 50,
-  'idle.hint': 50,
-  'chats.hint': 50,
-  'chats.unread': 24,
-  'chats.sending': 24,
-  'chats.sent': 50,
-  'chats.notSent': 50,
-  'message.hint.next': 50,
-  'message.hint.prev': 50,
-  'chat.hint.short': 50,
-  'chat.hint.long': 50,
-  'chat.summaryBadge': 50,
-  'fulltext.hint': 50,
-  'chat.empty': 50,
-  'chat.emptyHint': 50,
-  'options.title': 20,
-  'options.hint': 50,
-  'options.sayIt': 24,
-  'replies.emptyTitle': 20,
-  'replies.emptyHint': 50,
-  'confirm.title': 20,
-  'confirm.to': 50,
-  'confirm.hint': 50,
-  'quickReply.title': 20,
-  'quickReply.hint': 50,
-  'quickReply.to': 50,
-  'skip.title': 20,
-  'skip.body': 50,
-  'skip.meta': 24,
-  'skip.hint': 50,
-  'sent.title': 20,
-  'sent.hint': 50,
-  'error.title': 20,
-  'error.body': 50,
-  'error.sub': 50,
-  'error.hint': 50,
-  'voice.listening.title': 24,
-  'voice.listening.hint': 50,
-  'voice.listening.hintTap': 50,
-  'voice.heard.title': 24,
-  'voice.heard.hint': 50,
-  'voice.heard.phoneMic': 24,
-  'voice.heard.errorHint': 50,
-  'voice.heard.longHint': 50,
-  'voice.error.body': 50,
-  'voice.tooLong': 50,
-  'page.counter': 5,
-  'demo.lang': 32,
-  'demo.backend': 32,
-  'demo.mic': 32,
+/**
+ * One line of a full-width G2 text container: 576 − 2×20 = 536 px
+ * (design-system.md §2). Every dictionary string is laid out by the firmware
+ * at that width, so the check is the same measurement, not a character guess.
+ */
+const LINE_PX = 536
+
+/** Keys that live in a narrower box than the body: their own pixel budget. */
+const NARROW_PX = {
+  /** Counter inside the chat header: "1/2", "10/10". */
+  'page.counter': 70,
 }
 
-/** Context-menu items are limited by UTF-8 bytes, not characters. */
+/** Context-menu items are limited by UTF-8 bytes, not pixels. */
 const BYTE_LIMIT = ['demo.lang', 'demo.backend', 'demo.mic']
 
 const errors = []
@@ -128,15 +86,16 @@ for (const k of enKeys) {
     errors.push(`ru.${k}: plural without an "other" branch`)
   }
 
-  const limit = LIMITS[k]
-  if (limit !== undefined) {
-    // Measure the rendered form: placeholders are replaced by the shortest value.
-    // Variable parts (names, message texts) are bounded by data budgets, not the dictionary.
-    const fit = (x) => x.replace(/\{(\w+)(?:,\s*plural\s*,[\s\S]*?)?\}/g, '1')
-    const lenA = [...fit(a)].length
-    const lenB = [...fit(b)].length
-    if (lenA > limit) errors.push(`en.${k}: ${lenA} chars > ${limit}`)
-    if (lenB > limit) errors.push(`ru.${k}: ${lenB} chars > ${limit}`)
+  // Measure the rendered form: placeholders are replaced by the shortest value.
+  // Variable parts (names, message texts) are bounded by data budgets, not the dictionary.
+  const limit = NARROW_PX[k] ?? LINE_PX
+  const fit = (x) => x.replace(/\{(\w+)(?:,\s*plural\s*,[\s\S]*?)?\}/g, '1')
+  for (const [name, dict] of [
+    ['en', a],
+    ['ru', b],
+  ]) {
+    const px = getTextWidth(fit(dict))
+    if (px > limit) errors.push(`${name}.${k}: ${px} px > ${limit} px`)
   }
 
   if (BYTE_LIMIT.includes(k)) {

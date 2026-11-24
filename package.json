@@ -9,10 +9,12 @@
     "build": "node scripts/check-i18n.mjs && tsc -b && vite build",
     "lint": "oxlint",
     "simulate": "evenhub-simulator http://localhost:5173 --automation-port 9898",
-    "pack": "npm run build && evenhub pack app.json dist"
+    "qr": "evenhub qr --port 5173 --http",
+    "pack": "npm run build && evenhub pack app.json dist --sdk-ver 0.0.16"
   },
   "dependencies": {
     "@evenrealities/even_hub_sdk": "^0.0.16",
+    "@evenrealities/pretext": "^0.1.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
