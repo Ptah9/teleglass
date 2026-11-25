@@ -191,7 +191,7 @@ export const MOCK_INBOX: { chatId: string; message: MockMessage }[] = [
 ]
 
 /** Default text for the quick reply (set in the WebView; a constant in v0.1). */
-export const MOCK_QUICK_REPLY = "I'll reply later, busy now"
+export const MOCK_QUICK_REPLY = "I'll reply later, busy now."
 
 /** Recognition mock: a normal recording. */
 export const MOCK_HEARD_TEXT = 'Yes, 18:00 works, but only if we start on time.'

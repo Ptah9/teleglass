@@ -1,8 +1,8 @@
 import { makeT } from '../i18n'
 import { buildView, type View } from '../view/build'
 import { createTarget, type GlassesTarget, type MenuItem } from './adapter'
-import { initialState, reduce } from '../state/reducer'
-import type { AppEvent, AppState, AudioSource, Gesture } from '../state/types'
+import { initialState, reduce, visibleChats } from '../state/reducer'
+import type { AppEvent, AppState, AudioSource, Gesture, Lang } from '../state/types'
 import * as LINES from '../state/limits'
 
 /**
@@ -33,11 +33,20 @@ const TICK_MS = 200
 /** The microphone indicator is redrawn at most 5 times per second. */
 const AUDIO_RENDER_MS = 200
 
+export interface GlassesSettings {
+  lang: Lang
+  quickReply: string
+  telegramConnected: boolean
+  selectedChats: string[] | null
+}
+
 export interface Page {
   /** Event straight into the logic (list, menu, tick). */
   dispatch(e: AppEvent): void
   /** Gesture — through the debounce and the exit interceptor. */
   gesture(g: Gesture): void
+  /** Phone settings (T1/T3) pushed into the screen state. */
+  applySettings(settings: GlassesSettings): void
   subscribe(cb: (s: AppState) => void): () => void
   state(): AppState
   /** true — the page lives inside Even App (glasses), false — browser. */
@@ -314,6 +323,15 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
 
   target.onEvent((e) => dispatch(e))
 
+  /**
+   * Phone settings → glasses state. The merge lives in `mergeSettings` so the
+   * very first page can be built correct: a fresh install opens on "connect
+   * Telegram" instead of flashing the mock chat list for one frame.
+   */
+  function applySettings(v: GlassesSettings): void {
+    publish(mergeSettings(s, v))
+  }
+
   // First screen and ticks. StrictMode mounts components twice —
   // createPage is called once per page (see App.tsx).
   requestRender()
@@ -322,6 +340,7 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   return {
     dispatch,
     gesture,
+    applySettings,
     subscribe(cb) {
       listeners.add(cb)
       return () => {
@@ -333,16 +352,57 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   }
 }
 
+/** Order-insensitive comparison: the selection is a set, not a list. */
+function sameIds(a: string[] | null, b: string[] | null): boolean {
+  if (a === b) return true
+  if (a === null || b === null || a.length !== b.length) return false
+  const set = new Set(a)
+  return b.every((id) => set.has(id))
+}
+
+/**
+ * One merge point for the phone settings. A change from T1 or T3 cannot leave
+ * the screen on a chat the phone has excluded, and a disconnect always lands on
+ * CHATS (the same rule as the demo menu lever).
+ */
+function mergeSettings(s: AppState, v: GlassesSettings): AppState {
+  let next = s
+
+  if (next.lang !== v.lang) next = { ...next, lang: v.lang }
+  if (next.quickReplyText !== v.quickReply) next = { ...next, quickReplyText: v.quickReply }
+
+  if (next.telegramConnected !== v.telegramConnected) {
+    next = v.telegramConnected
+      ? { ...next, telegramConnected: true }
+      : {
+          ...next,
+          telegramConnected: false,
+          screen: { kind: 'chats' },
+          flash: null,
+          sendingRow: null,
+        }
+  }
+
+  if (!sameIds(next.selectedChats, v.selectedChats)) {
+    next = { ...next, selectedChats: v.selectedChats }
+    const count = visibleChats(next).length
+    next = { ...next, selChat: count === 0 ? 0 : Math.min(next.selChat, count - 1) }
+  }
+
+  return next
+}
+
 /** One target and one page for the whole app (StrictMode mounts twice). */
 let singleton: Promise<Page> | null = null
 
-export function getPage(): Promise<Page> {
+export function getPage(start?: GlassesSettings): Promise<Page> {
   singleton ??= createTarget().then(async (target) => {
-    // Language from the host storage (official persistence path); the rest of
-    // the state is a mock and starts fresh.
+    // Language from the host storage (official persistence path) is the fallback;
+    // the phone settings, when passed, win because they are the user's choice.
     const saved = await target.loadLang()
-    const start: AppState = saved ? { ...initialState(), lang: saved } : initialState()
-    const page = createPage(target, start)
+    let base = saved ? { ...initialState(), lang: saved } : initialState()
+    if (start) base = mergeSettings(base, start)
+    const page = createPage(target, base)
     console.log('[teleglass] target:', target.native ? 'glasses bridge' : 'browser mock')
     return page
   })

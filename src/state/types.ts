@@ -136,6 +136,12 @@ export interface AppState {
    */
   selChat: number
   quickReplyText: string
+  /**
+   * Chats the phone allowed the glasses to show (T1 `Save`). `null` = every chat.
+   * The filter belongs to the model, not to the screen: the list, the quick
+   * reply and the paging all read the same subset.
+   */
+  selectedChats: string[] | null
   /** Demo lever: "backend not responding". Toggled from the context menu. */
   backendDown: boolean
   /** Demo lever: force the phone microphone instead of the glasses one. */

@@ -1,51 +1,71 @@
-/* Dark theme: the page lives in the phone WebView next to the green preview. */
+/* Light product surface + the dark debug panel, scoped so they never mix. */
+
+@import './styles/tokens.css';
 
 :root {
-  color-scheme: dark;
-  font-family: system-ui, sans-serif;
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
 }
 
 body {
   margin: 0;
-  background: #101410;
-  color: #cfe8c6;
+  background: var(--bc-3);
+  color: var(--tc-1);
+  font-family: var(--font);
+  font-weight: 300;
 }
+
+button,
+input,
+textarea {
+  font-family: inherit;
+}
+
+/* ---------- debug panel (`?dev=1`) ---------- */
 
 .app {
-  max-width: 980px;
-  margin: 0 auto;
+  min-height: 100dvh;
   padding: 16px;
+  background: #101410;
+  color: #cfe8c6;
+  font-family: system-ui, sans-serif;
+  font-weight: 400;
 }
 
-header {
+.app header {
   display: flex;
   align-items: baseline;
   gap: 16px;
 }
 
-h1 {
+.app h1 {
   font-size: 20px;
   margin: 0;
 }
 
-h2 {
+.app h2 {
   font-size: 15px;
   margin: 0 0 8px;
 }
 
-.badge {
+.app .badge {
   font-size: 12px;
 }
 
-.badge.ok {
+.app .badge.ok {
   color: #9dff8a;
 }
 
-.badge.mock {
+.app .badge.mock {
   color: #8a7;
 }
 
-.grid {
+.app .grid {
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 24px;
@@ -53,7 +73,7 @@ h2 {
 }
 
 /* Glasses screen: the same coordinates that go to the SDK. */
-.g2 {
+.app .g2 {
   position: relative;
   width: 576px;
   height: 288px;
@@ -64,7 +84,7 @@ h2 {
   line-height: 24px;
 }
 
-.slot {
+.app .slot {
   position: absolute;
   white-space: pre-wrap;
   overflow: hidden;
@@ -72,46 +92,45 @@ h2 {
   box-sizing: border-box;
 }
 
-.g2-list {
+.app .g2-list {
   position: absolute;
 }
 
-.g2-list .row {
+.app .g2-list .row {
   display: block;
   width: 100%;
   height: 24px;
   padding: 0;
   border: 0;
   background: none;
-  color: inherit;
+  color: #9dff8a;
   font: inherit;
   line-height: 24px;
   text-align: left;
   cursor: pointer;
-  color: #9dff8a;
 }
 
-.g2-list .row.sel {
+.app .g2-list .row.sel {
   outline: 1px solid #9dff8a;
   outline-offset: -1px;
 }
 
-.controls {
+.app .controls {
   margin-top: 12px;
 }
 
-.btns {
+.app .btns {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 8px;
 }
 
-.btns.demo {
+.app .btns.demo {
   opacity: 0.8;
 }
 
-button {
+.app button {
   background: #1a241a;
   color: #cfe8c6;
   border: 1px solid #2f4a2f;
@@ -120,28 +139,28 @@ button {
   cursor: pointer;
 }
 
-button:hover {
+.app button:hover {
   border-color: #4b9a3d;
 }
 
-.dim {
+.app .dim {
   color: #7a967a;
 }
 
-.small {
+.app .small {
   font-size: 12px;
 }
 
-code {
+.app code {
   color: #9dff8a;
 }
 
-.log {
+.app .log {
   padding-left: 20px;
   font-size: 13px;
   color: #9bb89b;
 }
 
-.log li {
+.app .log li {
   margin: 2px 0;
 }

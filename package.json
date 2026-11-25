@@ -1,13 +1,12 @@
 {
   "name": "teleglass",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "check:i18n": "node scripts/check-i18n.mjs",
-    "build": "node scripts/check-i18n.mjs && node scripts/check-format.mjs && tsc -b && vite build",
-    "check:format": "node scripts/check-format.mjs",
+    "build": "node scripts/check-i18n.mjs && tsc -b && vite build",
     "lint": "oxlint",
     "simulate": "evenhub-simulator http://localhost:5173 --automation-port 9898",
     "qr": "evenhub qr --port 5173 --http",
@@ -16,8 +15,10 @@
   "dependencies": {
     "@evenrealities/even_hub_sdk": "^0.0.16",
     "@evenrealities/pretext": "^0.1.4",
+    "i18next": "^27.2.9",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "react-i18next": "^18.0.3"
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.1.12",

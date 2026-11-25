@@ -1,53 +1,65 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { api } from './api'
+import { hasDemoFlag } from './api/demo-flags'
+import { DebugPanel } from './dev/DebugPanel'
 import { getPage, type Page } from './even/page'
-import { makeT } from './i18n'
-import type { AppState, Gesture } from './state/types'
-import { buildView } from './view/build'
-import { GlassesPreview } from './view/preview'
+import { setLang, useT } from './i18n'
+import { PhoneApp } from './phone/PhoneApp'
+import { MOCK_QUICK_REPLY } from './state/data'
+import type { AppState } from './state/types'
+import { loadSettings, saveSettings, type Settings } from './store/settings'
 
 /**
- * Browser debug panel. Inside Even App it stays on the phone and doubles as a
- * backup remote: the buttons drive the same logic as the gestures from the
- * temple arm. In a plain browser it is the only way to drive the interface.
+ * One WebView, two surfaces. The phone shows `PhoneApp` (auth, chats, settings);
+ * the glasses are a render target driven by `Page` (Even Hub containers). State
+ * lives here, in the WebView — the glasses hold none (official FAQ).
  *
- * Panel strings also go through the dictionary (dev.* keys): no literals in markup.
+ * `?dev=1` swaps the phone surface for the glasses debug panel used during
+ * development and by the simulator scripts.
  */
-
-interface LogEntry {
-  id: number
-  kind: string
-}
+const toGlasses = (s: Settings) => ({
+  lang: s.lang,
+  quickReply: s.quickReply.trim().length > 0 ? s.quickReply : MOCK_QUICK_REPLY,
+  telegramConnected: s.telegram,
+  selectedChats: s.selectedChats,
+})
 
 export default function App() {
-  const [state, setState] = useState<AppState | null>(null)
+  const dev = useMemo(() => {
+    const params = new URLSearchParams(window.location.search)
+    return params.has('dev') || params.has('panel')
+  }, [])
+
+  const [page, setPage] = useState<Page | null>(null)
+  const [appState, setAppState] = useState<AppState | null>(null)
+  const [settings, setSettings] = useState<Settings>(() => {
+    const loaded = loadSettings()
+    // QA only: `?demo=connected` opens the tabs without the fake sign-in.
+    // The flag lives in the address, so the packaged build is unaffected.
+    return hasDemoFlag('connected') ? { ...loaded, telegram: true } : loaded
+  })
   const [native, setNative] = useState<boolean | null>(null)
   const [bootFailed, setBootFailed] = useState(false)
-  const [screens, setScreens] = useState<LogEntry[]>([])
-  const pageRef = useRef<Page | null>(null)
-  const lastKind = useRef('')
-  const logSeq = useRef(0)
 
+  // Boot the glasses page once (StrictMode mounts twice; getPage is a singleton).
   useEffect(() => {
     let alive = true
     let stop: (() => void) | undefined
-    getPage()
-      .then((page) => {
+    getPage(toGlasses(loadSettings()))
+      .then((p) => {
         if (!alive) return
-        pageRef.current = page
-        setState(page.state())
-        setNative(page.native)
-        stop = page.subscribe((s) => {
-          setState(s)
-          if (s.screen.kind !== lastKind.current) {
-            lastKind.current = s.screen.kind
-            const id = ++logSeq.current
-            setScreens((prev) => [{ id, kind: s.screen.kind }, ...prev].slice(0, 24))
-          }
+        setPage(p)
+        setNative(p.native)
+        setAppState(p.state())
+        stop = p.subscribe((s) => {
+          setAppState(s)
+          // The glasses demo lever can change the language from the temple arm;
+          // adopt it into the phone setting instead of letting the screens disagree.
+          setSettings((prev) => (prev.lang === s.lang ? prev : { ...prev, lang: s.lang }))
         })
       })
       .catch((err: unknown) => {
-        // Never leave the panel on "connecting…": a failed boot is a message,
-        // not a spinner (app-submission.md: no infinite spinner).
+        // Never leave the screen on "connecting…" — a failed boot is a message.
         console.error('[teleglass] page failed to start:', err)
         if (alive) setBootFailed(true)
       })
@@ -57,90 +69,78 @@ export default function App() {
     }
   }, [])
 
-  const t = makeT(state?.lang ?? 'en')
-  const view = state ? buildView(state, t) : null
+  // Settings are the single source for both surfaces: persist and push.
+  useEffect(() => {
+    if (!page) return
+    saveSettings(settings)
+    page.applySettings(toGlasses(settings))
+  }, [page, settings])
 
-  if (!state || !view) {
+  // Mirror to the backend for the LLM (tone) and the server-side flow. Debounced:
+  // typing a quick reply must not send a request per keystroke.
+  useEffect(() => {
+    if (!page) return
+    const timer = window.setTimeout(() => {
+      void api
+        .putSettings({
+          lang: settings.lang,
+          quickReply: settings.quickReply,
+          tone: settings.tone,
+          selectedChats: settings.selectedChats,
+          llmModel: settings.llmModel,
+        })
+        .catch((err: unknown) => console.warn('[teleglass] settings were not mirrored:', err))
+    }, 600)
+    return () => window.clearTimeout(timer)
+  }, [page, settings])
+
+  const updateSettings = useCallback((patch: Partial<Settings>) => {
+    setSettings((prev) => ({ ...prev, ...patch }))
+  }, [])
+
+  // Settings stay the source of truth for both surfaces; i18next follows them.
+  useEffect(() => {
+    setLang(settings.lang)
+  }, [settings.lang])
+
+  const t = useT()
+
+  if (bootFailed) {
     return (
-      <div className="app">
-        <p className="dim">{bootFailed ? t('dev.bootError') : t('dev.connecting')}</p>
+      <div className="phone">
+        <div className="auth">
+          <div className="auth__success">
+            <span className="h-large">{t('app.name')}</span>
+            <span className="detail dim">{t('dev.bootError')}</span>
+          </div>
+        </div>
       </div>
     )
   }
 
-  // The ref is read only in handlers, never in the render body.
-  const g = (x: Gesture) => () => {
-    pageRef.current?.gesture(x)
+  if (!page || !appState) {
+    return (
+      <div className="phone">
+        <div className="auth">
+          <div className="auth__success">
+            <span className="h-large">{t('app.name')}</span>
+            <span className="detail dim">{t('dev.connecting')}</span>
+          </div>
+        </div>
+      </div>
+    )
   }
 
-  // A swipe over the list moves the selection (as the glasses firmware does),
-  // over text it is a regular gesture.
-  const swipe = (dir: 'up' | 'down') => () => {
-    const page = pageRef.current
-    if (!page) return
-    if (view.list) {
-      const next = dir === 'up' ? view.list.sel - 1 : view.list.sel + 1
-      page.dispatch({ type: 'listSelect', index: next })
-    } else {
-      page.gesture(dir === 'up' ? 'swipeUp' : 'swipeDown')
-    }
+  if (dev) {
+    return <DebugPanel page={page} state={appState} native={native} />
   }
-
-  const menu = (item: number) => () => {
-    pageRef.current?.dispatch({ type: 'menu', item })
-  }
-
-  const row = (index: number) => () => {
-    pageRef.current?.dispatch({ type: 'listClick', index })
-  }
-
-  const badge =
-    native === null ? t('dev.connecting')
-      : native ? t('dev.native')
-        : t('dev.mock')
 
   return (
-    <div className="app">
-      <header>
-        <h1>{t('app.name')}</h1>
-        <p className={`badge ${native ? 'ok' : 'mock'}`}>{badge}</p>
-      </header>
-
-      <div className="grid">
-        <section>
-          <GlassesPreview view={view} onRow={(i) => row(i)()} />
-
-          <div className="controls">
-            <div className="btns">
-              <button type="button" onClick={swipe('up')}>{t('dev.up')}</button>
-              <button type="button" onClick={g('click')}>{t('dev.tap')}</button>
-              <button type="button" onClick={swipe('down')}>{t('dev.down')}</button>
-              <button type="button" onClick={g('doubleClick')}>{t('dev.double')}</button>
-              <button type="button" onClick={g('longPress')}>{t('dev.hold')}</button>
-              <button type="button" onClick={g('longPressRelease')}>{t('dev.release')}</button>
-            </div>
-            <div className="btns demo">
-              <button type="button" onClick={menu(1)}>{t('dev.lang')}</button>
-              <button type="button" onClick={menu(2)}>{t('dev.backend')}</button>
-              <button type="button" onClick={menu(3)}>{t('dev.mic')}</button>
-              <button type="button" onClick={menu(4)}>{t('dev.telegram')}</button>
-              <button type="button" onClick={menu(5)}>{t('dev.read')}</button>
-            </div>
-          </div>
-        </section>
-
-        <aside>
-          <h2>{t('dev.log')}</h2>
-          <p className="dim small">
-            {t('dev.state')}: <code>{state.screen.kind}</code>
-          </p>
-          <ol className="log">
-            {screens.map((e) => (
-              <li key={e.id}>{e.kind}</li>
-            ))}
-          </ol>
-        </aside>
-      </div>
-    </div>
+    <PhoneApp
+      t={t}
+      settings={settings}
+      onChange={updateSettings}
+      appState={appState}
+    />
   )
 }

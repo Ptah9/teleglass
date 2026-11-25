@@ -1,0 +1,47 @@
+/*
+ * Official Even Realities light palette, taken from
+ * `Even Realities - Software Design Guidelines (APP)` (export 25.11.2026)
+ * and matching `even-toolkit/web/theme/tokens-light.css` one to one.
+ * `ux-webview.md` §2. Do not invent colours here: a new colour is a redesign.
+ */
+
+:root {
+  /* Text */
+  --tc-1: #232323; /* TC - 1st */
+  --tc-2: #7b7b7b; /* TC - 2nd */
+  --tc-red: #ff453a; /* TC - Red */
+  --tc-green: #4bb956; /* TC - Green */
+  --tc-highlight: #ffffff; /* TC - Highlight */
+
+  /* Backgrounds */
+  --bc-1: #ffffff; /* BC - 1st, cards */
+  --bc-2: #f6f6f6; /* BC - 2nd */
+  --bc-3: #eeeeee; /* BC - 3rd, page */
+  --bc-4: #e4e4e4; /* BC - 4th, disabled fill */
+  --bc-highlight: #232323; /* BC - Highlight, accent button */
+  --bc-accent: #fef991; /* BC - Accent, warnings and toasts */
+
+  /* Overlay and input */
+  --sc-1: rgba(0, 0, 0, 0.5); /* SC - 1st */
+  --sc-2: rgba(35, 35, 35, 0.08); /* SC - 2nd, input fill */
+
+  /* Layout: 12 margin, 16 card, 6 / 12 / 24 rhythm, radius 6 */
+  --margin: 12px;
+  --card-padding: 16px;
+  --gap-same: 6px;
+  --gap-cross: 12px;
+  --gap-section: 24px;
+  --radius: 6px;
+
+  /* Typography: eight official styles, only 400 and 300 */
+  --font: 'FK Grotesk Neue', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --t-very-large: 24px;
+  --t-large: 20px;
+  --t-medium: 17px;
+  --t-normal: 15px;
+  --t-subtitle: 13px;
+  --t-detail: 11px;
+
+  /* Not in the guideline, but a phone control needs a touch target. */
+  --tap: 44px;
+}

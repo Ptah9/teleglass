@@ -43,6 +43,7 @@ export function initialState(): AppState {
     read: {},
     selChat: 0,
     quickReplyText: MOCK_QUICK_REPLY,
+    selectedChats: null,
     backendDown: false,
     phoneMic: false,
     telegramConnected: true,
@@ -68,7 +69,10 @@ export function unreadMsgs(chat: MockChat, read: Record<string, true>): MockMess
 }
 
 export function visibleChats(s: AppState): MockChat[] {
-  return s.chats.filter((c) => unreadMsgs(c, s.read).length > 0)
+  const offered = s.chats.filter((c) => unreadMsgs(c, s.read).length > 0)
+  if (s.selectedChats === null) return offered
+  const allowed = new Set(s.selectedChats)
+  return offered.filter((c) => allowed.has(c.id))
 }
 
 /** 'Ivan · Project' / 'Mom' — as in the screen body (to Ivan · Project). */
