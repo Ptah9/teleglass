@@ -1,6 +1,6 @@
 import type { TFunc } from '../i18n'
 import { chatById, chatLabel, unreadMsgs, visibleChats } from '../state/reducer'
-import type { AppState } from '../state/types'
+import type { AppState, Screen } from '../state/types'
 import { clipLines, lineCount } from '../state/wrap'
 import * as LINES from '../state/limits'
 import { stamp } from './stamp'
@@ -148,6 +148,19 @@ export function buildView(s: AppState, t: TFunc): View {
 // ---------------------------------------------------------------------------
 
 function chatsView(s: AppState, t: TFunc): View {
+  // Telegram is not linked: there is no list to show, and the only place that
+  // can fix it is the phone (ux-flow.md inventory, «Connect Telegram on your
+  // phone.»). The footer stays empty — no gesture on this screen does anything.
+  if (!s.telegramConnected) {
+    const texts = textsOf([
+      { id: 'title', slot: 'title', content: t('idle.title'), level: LVL.main },
+      dividerSpec('divider'),
+      { id: 'body', slot: 'body', content: t('idle.setup'), level: LVL.body, capture: true },
+      { id: 'footer', slot: 'footer', content: '', level: LVL.caption },
+    ])
+    return { shape: shapeOf(texts), texts }
+  }
+
   const visible = visibleChats(s)
 
   // The CHATS footer changes with the quick reply state: normal, sent (2 s), not sent.
@@ -443,6 +456,20 @@ function offlineView(_s: AppState, t: TFunc): View {
 // Voice.
 // ---------------------------------------------------------------------------
 
+/**
+ * LISTENING footer. Two things change it: how the recording was started (the
+ * hold has no fingers left for a swipe) and which microphone is live. With the
+ * phone microphone the caption has to say so (design-system.md §5.1) — and the
+ * combined line does not fit 536 px on the hold screen in Russian, so the
+ * cancel hint goes: while holding, a swipe is out of reach anyway.
+ */
+function listeningHint(scr: Extract<Screen, { kind: 'listening' }>, t: TFunc): string {
+  if (scr.source === 'phone') {
+    return scr.mode === 'hold' ? t('voice.listening.hintPhone') : t('voice.listening.hintTapPhone')
+  }
+  return scr.mode === 'hold' ? t('voice.listening.hint') : t('voice.listening.hintTap')
+}
+
 function listeningView(s: AppState, t: TFunc): View {
   const scr = s.screen
   if (scr.kind !== 'listening') return chatsView(s, t)
@@ -460,7 +487,7 @@ function listeningView(s: AppState, t: TFunc): View {
     {
       id: 'footer',
       slot: 'footer',
-      content: scr.mode === 'hold' ? t('voice.listening.hint') : t('voice.listening.hintTap'),
+      content: listeningHint(scr, t),
       level: LVL.caption,
     },
   ])
@@ -485,6 +512,9 @@ function heardView(s: AppState, t: TFunc): View {
   // The transcript is handed to the firmware as is: the body is event-capturing,
   // so the firmware scrolls overflowing text itself and draws its own scrollbar.
   // Our own rail/slider is not needed (and would duplicate the stock one).
+  // The footer says "scroll" only when there is something to scroll: on a text
+  // that fits, a scroll hint would promise a gesture that does nothing.
+  const scrolls = lineCount(scr.text) > BODY_LINES
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('voice.heard.title'), level: LVL.main },
     dividerSpec('divider'),
@@ -495,7 +525,12 @@ function heardView(s: AppState, t: TFunc): View {
       content: scr.variant === 'phoneMic' ? t('voice.heard.phoneMic') : '',
       level: LVL.caption,
     },
-    { id: 'footer', slot: 'footer', content: t('voice.heard.hint'), level: LVL.caption },
+    {
+      id: 'footer',
+      slot: 'footer',
+      content: scrolls ? t('voice.heard.scrollHint') : t('voice.heard.hint'),
+      level: LVL.caption,
+    },
   ])
   return { shape: shapeOf(texts), texts }
 }

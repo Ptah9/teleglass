@@ -2,7 +2,8 @@ import { makeT } from '../i18n'
 import { buildView, type View } from '../view/build'
 import { createTarget, type GlassesTarget, type MenuItem } from './adapter'
 import { initialState, reduce } from '../state/reducer'
-import type { AppEvent, AppState, Gesture } from '../state/types'
+import type { AppEvent, AppState, AudioSource, Gesture } from '../state/types'
+import * as LINES from '../state/limits'
 
 /**
  * Orchestrator: holds the state, runs the reducer, writes the picture to target.
@@ -66,6 +67,13 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
           value: t(s.phoneMic ? 'demo.value.phone' : 'demo.value.glasses'),
         }),
       },
+      {
+        id: 4,
+        name: t('demo.telegram', {
+          value: t(s.telegramConnected ? 'demo.value.on' : 'demo.value.off'),
+        }),
+      },
+      { id: 5, name: t('demo.read') },
     ]
   }
 
@@ -97,6 +105,92 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     void drain()
   }
 
+  /**
+   * The microphone is one resource with one owner: this page. The screen only
+   * says which source it believes in; the page opens it, watches for silence
+   * and falls back to the phone microphone when the glasses give nothing.
+   */
+  let micSeq = 0
+  let micTimer: number | null = null
+  /** A chunk arrived for the current attempt — the 2 s fallback is not needed. */
+  let micHeard = false
+  let recordTimer: number | null = null
+
+  function clearMicTimer(): void {
+    if (micTimer !== null) {
+      window.clearTimeout(micTimer)
+      micTimer = null
+    }
+  }
+
+  function stopMic(source: AudioSource): void {
+    micSeq++
+    clearMicTimer()
+    void target.audio(false, source)
+  }
+
+  /**
+   * Open the microphone and arm the fallback. `seq` invalidates the answers of
+   * attempts that are already over: the user may leave LISTENING mid-call.
+   */
+  async function openMic(source: AudioSource): Promise<void> {
+    const seq = ++micSeq
+    clearMicTimer()
+    micHeard = false
+
+    const ok = await target.audio(true, source)
+    if (seq !== micSeq || s.screen.kind !== 'listening') return
+
+    if (!ok) {
+      // Refused (permission, or no capture on this host). The glasses one is the
+      // default, so its refusal is what the phone fallback exists for.
+      console.warn('[teleglass] microphone refused:', source)
+      if (source === 'glasses') {
+        void target.audio(false, 'glasses')
+        apply({ type: 'micSource', source: 'phone' })
+      }
+      return
+    }
+
+    // No glasses in a browser: there is nothing to fall back from.
+    if (source !== 'glasses' || !target.native) return
+
+    micTimer = window.setTimeout(() => {
+      micTimer = null
+      if (seq !== micSeq || micHeard || s.screen.kind !== 'listening') return
+      // 2 s without a single chunk: the glasses are not recording. Take the
+      // phone microphone and say so in the footer (design-system.md §5.1).
+      console.warn('[teleglass] no audio in 2 s — switching to the phone microphone')
+      void target.audio(false, 'glasses')
+      apply({ type: 'micSource', source: 'phone' })
+    }, LINES.MIC_FALLBACK_MS)
+  }
+
+  /**
+   * Hard cap on one recording: the hold is a press/release pair and the OS may
+   * swallow the release (ux-flow.md § Что может не сойтись). The synthetic
+   * gesture is the same one the user would send.
+   */
+  function armRecordWatchdog(): void {
+    clearRecordWatchdog()
+    recordTimer = window.setTimeout(() => {
+      recordTimer = null
+      if (s.screen.kind !== 'listening') return
+      console.warn('[teleglass] recording stopped at the cap:', LINES.MAX_RECORD_MS, 'ms')
+      apply({
+        type: 'gesture',
+        gesture: s.screen.mode === 'hold' ? 'longPressRelease' : 'click',
+      })
+    }, LINES.MAX_RECORD_MS)
+  }
+
+  function clearRecordWatchdog(): void {
+    if (recordTimer !== null) {
+      window.clearTimeout(recordTimer)
+      recordTimer = null
+    }
+  }
+
   function publish(next: AppState): void {
     if (next === s) return
     const prev = s
@@ -108,15 +202,17 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
       console.log(`[teleglass] screen: ${prev.screen.kind} → ${s.screen.kind}`)
     }
 
-    // Microphone follows the LISTENING screen: on when it opens (or when the
-    // source lever flips), off when it closes.
-    const wasOn = prev.screen.kind === 'listening'
-    const isOn = s.screen.kind === 'listening'
-    if (wasOn || isOn) {
-      const source = s.phoneMic ? 'phone' : 'glasses'
-      const prevSource = prev.phoneMic ? 'phone' : 'glasses'
-      if (!isOn) void target.audio(false, prevSource)
-      else if (!wasOn || source !== prevSource) void target.audio(true, source)
+    // Microphone follows the LISTENING screen and the source it shows.
+    if (s.screen.kind === 'listening') {
+      const prevSource = prev.screen.kind === 'listening' ? prev.screen.source : null
+      if (prevSource !== s.screen.source) {
+        if (prevSource !== null) stopMic(prevSource)
+        void openMic(s.screen.source)
+      }
+      if (prev.screen.kind !== 'listening') armRecordWatchdog()
+    } else if (prev.screen.kind === 'listening') {
+      stopMic(prev.screen.source)
+      clearRecordWatchdog()
     }
 
     // Language is a host preference: store it where a WebView restart cannot lose it.
@@ -134,6 +230,7 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   let lastAudioRender = 0
 
   function applyAudio(e: AppEvent): void {
+    if (s.screen.kind === 'listening') micHeard = true
     const next = reduce(s, e)
     if (next === s) return
     s = next
@@ -203,6 +300,12 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
         return
       case 'audio':
         applyAudio(e)
+        return
+      case 'foreground':
+        apply(e)
+        // Audio capture stops while the WebView is suspended
+        // (background-lifecycle.md): ask for the same source again.
+        if (s.screen.kind === 'listening') void openMic(s.screen.source)
         return
       default:
         apply(e)

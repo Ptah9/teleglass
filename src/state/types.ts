@@ -27,10 +27,21 @@ export type AppEvent =
   | { type: 'listSelect'; index: number }
   /** Tap on a list item; index = -1 when the index did not arrive (simulator quirk). */
   | { type: 'listClick'; index: number }
-  /** Context menu item (v0.1 demo levers: language, backend, microphone). */
+  /** Context menu item (v0.1 demo levers: language, backend, microphone, Telegram). */
   | { type: 'menu'; item: number }
-  /** Microphone level 0…1 from one SDK audio chunk, while LISTENING is open. */
+  /**
+   * Microphone level 0…1 from one SDK audio chunk, while LISTENING is open.
+   * The source is decided by the page (lever, refusal, 2 s of silence) and
+   * reported by `micSource`: one owner for the microphone state machine.
+   */
   | { type: 'audio'; level: number }
+  /** The page switched the microphone; LISTENING shows which one is live. */
+  | { type: 'micSource'; source: AudioSource }
+  /**
+   * The page came back to the foreground (docs: background-lifecycle.md).
+   * Audio capture stops while the WebView is suspended, so it is re-armed here.
+   */
+  | { type: 'foreground' }
   | { type: 'tick'; now: number }
 
 /** Message from Telegram. A mock in v0.1; the summary field appears when the text is long. */
@@ -38,7 +49,7 @@ export interface MockMessage {
   id: string
   at: string
   text: string
-  /** If the text does not fit into 6 lines, CHAT shows the summary. */
+  /** If the text does not fit into the CHAT body, CHAT shows the summary. */
   summary?: string
   /** Empty array = NO REPLIES screen. */
   replies: string[]
@@ -52,6 +63,9 @@ export interface MockChat {
 }
 
 export type AudioSource = 'glasses' | 'phone'
+
+/** HEARD states: recognized text, "did not catch it", "phone microphone". */
+export type HeardVariant = 'ok' | 'error' | 'phoneMic'
 
 export type Screen =
   | { kind: 'chats' }
@@ -68,6 +82,8 @@ export type Screen =
       reply: string
       /** "No" goes back where the reply came from: the options or the transcript. */
       from: 'replies' | 'heard'
+      /** Which HEARD the transcript came from, so "no" restores the same caption. */
+      heardVariant?: 'ok' | 'phoneMic'
     }
   | { kind: 'quickConfirm'; chatId: string }
   | {
@@ -93,6 +109,8 @@ export type Screen =
       chatId: string
       msgIndex: number
       mode: 'hold' | 'tap'
+      /** Which microphone records right now; the phone one is the fallback. */
+      source: AudioSource
       startAt: number
       /** Recent microphone levels (0…1), one per SDK audio chunk (100 ms). */
       levels: number[]
@@ -101,7 +119,7 @@ export type Screen =
       kind: 'heard'
       chatId: string
       msgIndex: number
-      variant: 'ok' | 'error' | 'phoneMic'
+      variant: HeardVariant
       text: string
     }
 
@@ -120,12 +138,24 @@ export interface AppState {
   quickReplyText: string
   /** Demo lever: "backend not responding". Toggled from the context menu. */
   backendDown: boolean
-  /** Demo lever: HEARD "phone microphone" variant. */
+  /** Demo lever: force the phone microphone instead of the glasses one. */
   phoneMic: boolean
+  /**
+   * Telegram account link state. The setup screen appears when it is false
+   * (ux-flow.md inventory: «CHATS — Telegram не подключён»); in v0.1 it is a
+   * demo lever, in the real app the backend reports it.
+   */
+  telegramConnected: boolean
+  /**
+   * Demo lever for the race ux-flow.md describes: the phone marked the selected
+   * chat read while the glasses list still shows it. The next tap on that chat
+   * lands on CHAT with nothing unread.
+   */
+  phoneRead: string | null
   lastChecked: string
   /**
    * Flashing CHATS footer line: `sent · X` for 2 seconds,
-   * `not sent · hold to retry` — until the send is retried (until = 0).
+   * `not sent · hold to retry` for NOT_SENT_MS (both arrive as a deadline).
    */
   flash: { key: 'sent' | 'notSent'; person: string; chatId: string; until: number } | null
   /** chatId whose CHATS row currently shows sending… */

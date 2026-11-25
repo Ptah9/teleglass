@@ -57,7 +57,7 @@ export interface GlassesTarget {
   loadLang(): Promise<Lang | null>
   saveLang(lang: Lang): Promise<void>
   /** Microphone on/off through the SDK; the level arrives as an AppEvent. */
-  audio(on: boolean, source: AudioSource): Promise<void>
+  audio(on: boolean, source: AudioSource): Promise<boolean>
 }
 
 /**
@@ -211,6 +211,14 @@ function nativeTarget(bridge: EvenAppBridge): GlassesTarget {
     // Text or system: gesture by eventType.
     const src = ev.textEvent ?? ev.sysEvent
     if (!src) return
+    // Foreground events are not gestures: the page came back (or the menu
+    // overlay opened). FOREGROUND_EXIT is the menu overlay closing, not the app
+    // leaving, so nothing is torn down here (docs: contextual-menu.md).
+    if (src.eventType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
+      emit({ type: 'foreground' })
+      return
+    }
+    if (src.eventType === OsEventTypeList.FOREGROUND_EXIT_EVENT) return
     const g = gestureOf(src.eventType)
     if (g) emit({ type: 'gesture', gesture: g })
   })
@@ -398,15 +406,21 @@ function nativeTarget(bridge: EvenAppBridge): GlassesTarget {
       }
     },
     async audio(on, source) {
-      audioOn = on
       try {
-        await bridge.audioControl(
+        const ok = await bridge.audioControl(
           on,
           source === 'phone' ? AudioInputSource.Phone : AudioInputSource.Glasses,
         )
+        // The host answers false when the capture did not start: the page then
+        // falls back to the other microphone instead of showing a flat line.
+        audioOn = on && ok
+        if (!ok) console.warn('[teleglass] audioControl → false:', on, source)
+        return ok
       } catch (err) {
         // No permission or no capture on this host: the indicator stays flat.
         console.warn('[teleglass] audioControl failed:', err)
+        audioOn = false
+        return false
       }
     },
   }
@@ -463,7 +477,9 @@ function browserTarget(): GlassesTarget {
       window.localStorage.setItem(LANG_KEY, lang)
     },
     async audio() {
-      /* no glasses microphone outside Even App: the indicator stays flat */
+      // No glasses microphone outside Even App: the preview drives LISTENING by
+      // hand, and a "refused" answer would send the demo to the phone variant.
+      return true
     },
   }
 }

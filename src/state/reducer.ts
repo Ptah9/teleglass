@@ -5,7 +5,7 @@ import {
   MOCK_INBOX,
   MOCK_QUICK_REPLY,
 } from './data'
-import type { AppEvent, AppState, Gesture, MockChat, MockMessage } from './types'
+import type { AppEvent, AppState, AudioSource, Gesture, MockChat, MockMessage } from './types'
 import { lineCount } from './wrap'
 import * as LINES from './limits'
 /**
@@ -45,6 +45,8 @@ export function initialState(): AppState {
     quickReplyText: MOCK_QUICK_REPLY,
     backendDown: false,
     phoneMic: false,
+    telegramConnected: true,
+    phoneRead: null,
     lastChecked: '19:42',
     flash: null,
     sendingRow: null,
@@ -118,6 +120,12 @@ export function reduce(s: AppState, e: AppEvent): AppState {
       return onMenu(s, e.item)
     case 'audio':
       return onAudio(s, e.level)
+    case 'micSource':
+      return onMicSource(s, e.source)
+    case 'foreground':
+      // Re-arming the microphone is a page duty (it owns the SDK calls); the
+      // logic has nothing to change, the screen stays as it was.
+      return s
     case 'tick':
       return onTick(s, e.now)
   }
@@ -167,6 +175,10 @@ function chatsScreen(s: AppState): AppState {
 }
 
 function onChats(s: AppState, g: Gesture): AppState {
+  // Not linked to Telegram: there is nothing to open and nothing to send —
+  // the screen only says what to do on the phone (ux-flow.md inventory).
+  if (!s.telegramConnected) return s
+
   const visible = visibleChats(s)
 
   switch (g) {
@@ -229,7 +241,8 @@ function clampSel(s: AppState, length: number): number {
   return Math.min(Math.max(s.selChat, 0), length - 1)
 }
 
-function checkAgain(s: AppState): AppState {  const now = timeStr()
+function checkAgain(s: AppState): AppState {
+  const now = timeStr()
   const [head, ...rest] = s.inboxQueue
   if (!head) return { ...s, lastChecked: now }
   const chats = s.chats.map((c) =>
@@ -242,6 +255,18 @@ function openChat(s: AppState, index: number): AppState {
   const visible = visibleChats(s)
   const chat = visible[index]
   if (!chat) return s
+  // The phone may have read this chat while the glasses list still showed it.
+  // Then the tap lands on a chat with nothing unread — that is the
+  // «CHAT — непрочитанных нет» state from the ux-flow inventory.
+  if (s.phoneRead === chat.id) {
+    return {
+      ...s,
+      read: markAllRead(s, chat.id),
+      phoneRead: null,
+      selChat: index,
+      screen: { kind: 'chatEmpty', chatId: chat.id },
+    }
+  }
   const msgs = unreadMsgs(chat, s.read)
   if (msgs.length === 0) {
     return { ...s, selChat: index, screen: { kind: 'chatEmpty', chatId: chat.id } }
@@ -362,6 +387,7 @@ function onReplies(s: AppState, g: Gesture): AppState {
           chatId: scr.chatId,
           msgIndex: scr.msgIndex,
           mode: 'hold',
+          source: s.phoneMic ? 'phone' : 'glasses',
           startAt: Date.now(),
           levels: [],
         },
@@ -423,7 +449,7 @@ function onConfirm(s: AppState, g: Gesture): AppState {
             kind: 'heard',
             chatId: scr.chatId,
             msgIndex: scr.msgIndex,
-            variant: s.phoneMic ? 'phoneMic' : 'ok',
+            variant: scr.heardVariant ?? 'ok',
             text: scr.reply,
           },
         }
@@ -556,12 +582,13 @@ function stopListening(s: AppState): AppState {
     }
   }
   // Long hold — long transcript; the text itself is shown in full and scrolls.
+  // The caption follows the microphone that actually recorded, not the lever.
   return {
     ...s,
     screen: {
       kind: 'heard',
       ...base,
-      variant: s.phoneMic ? 'phoneMic' : 'ok',
+      variant: scr.source === 'phone' ? 'phoneMic' : 'ok',
       text: dur > LONG_RECORD_MS ? MOCK_HEARD_LONG : MOCK_HEARD_TEXT,
     },
   }
@@ -595,6 +622,8 @@ function onHeard(s: AppState, g: Gesture): AppState {
           msgIndex: scr.msgIndex,
           reply: scr.text,
           from: 'heard',
+          // Keep the caption: after "no" the transcript returns as it was.
+          heardVariant: scr.variant === 'phoneMic' ? 'phoneMic' : 'ok',
         },
       }
     case 'longPress':
@@ -617,6 +646,7 @@ function startListeningAgain(s: AppState, mode: 'hold' | 'tap'): AppState {
       chatId: scr.chatId,
       msgIndex: scr.msgIndex,
       mode,
+      source: s.phoneMic ? 'phone' : 'glasses',
       startAt: Date.now(),
       levels: [],
     },
@@ -678,6 +708,7 @@ function onListClick(s: AppState, index: number): AppState {
             chatId: scr.chatId,
             msgIndex: scr.msgIndex,
             mode: 'tap',
+            source: s.phoneMic ? 'phone' : 'glasses',
             startAt: Date.now(),
             levels: [],
           },
@@ -713,6 +744,28 @@ function onMenu(s: AppState, item: number): AppState {
       return { ...s, backendDown: !s.backendDown }
     case 3:
       return { ...s, phoneMic: !s.phoneMic }
+    case 4: {
+      // The backend reporting "not linked" takes the glasses back to CHATS:
+      // every inner screen belongs to a conversation that cannot be reached.
+      const telegramConnected = !s.telegramConnected
+      if (telegramConnected) return { ...s, telegramConnected }
+      return {
+        ...s,
+        telegramConnected,
+        screen: { kind: 'chats' },
+        flash: null,
+        sendingRow: null,
+      }
+    }
+    case 5: {
+      // "The phone read the selected chat": the list is one tap behind, the
+      // tap opens CHAT with nothing unread. Toggling again takes it back.
+      const visible = visibleChats(s)
+      if (visible.length === 0) return s
+      const chat = visible[clampSel(s, visible.length)]
+      if (!chat) return s
+      return { ...s, phoneRead: s.phoneRead === chat.id ? null : chat.id }
+    }
     default:
       return s
   }
@@ -743,6 +796,16 @@ function onAudio(s: AppState, level: number): AppState {
   return { ...s, screen: { ...scr, levels } }
 }
 
+/**
+ * The page switched the microphone (glasses refused, or 2 s without data).
+ * LISTENING shows which source is live, and HEARD keeps that caption.
+ */
+function onMicSource(s: AppState, source: AudioSource): AppState {
+  const scr = s.screen
+  if (scr.kind !== 'listening' || scr.source === source) return s
+  return { ...s, screen: { ...scr, source } }
+}
+
 function resolveSending(s: AppState, now: number): AppState {
   const scr = s.screen
   if (scr.kind !== 'sending') return s
@@ -762,11 +825,12 @@ function resolveSending(s: AppState, now: number): AppState {
       }
     }
     // The quick reply did not go through: the chat stays, the footer shows
-    // "not sent · hold to retry" (until = 0).
+    // "not sent · hold to retry" for NOT_SENT_MS — long enough to read and to
+    // retry, short enough not to become a permanent screen state.
     return {
       ...s,
       sendingRow: null,
-      flash: { key: 'notSent', person, chatId: scr.chatId, until: 0 },
+      flash: { key: 'notSent', person, chatId: scr.chatId, until: now + LINES.NOT_SENT_MS },
       screen: { kind: 'chats' },
     }
   }
