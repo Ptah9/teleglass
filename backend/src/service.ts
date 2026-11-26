@@ -36,11 +36,26 @@ export interface AuthService {
 
   chats(token: string | null): Promise<ChatSummary[]>
   /**
-   * The last messages of one dialog, oldest first — the CHAT screen pages from
+   * The last messages of one dialog, oldest first - the CHAT screen pages from
    * the top. Without an access hash in the request the service resolves the
    * peer from its own cache (filled by `chats`).
+   *
+   * `withHistory` also returns the messages just above the read watermark: the
+   * LLM needs a transcript even when the whole unread block is one message.
+   * The CHAT screen never asks for it - it must not show read messages.
    */
-  messages(token: string | null, chatId: string, limit?: number): Promise<MessageSummary[]>
+  messages(
+    token: string | null,
+    chatId: string,
+    limit?: number,
+    withHistory?: boolean,
+  ): Promise<MessageSummary[]>
+
+  /**
+   * The unread counter from the dialog cache, synchronously cheap (no RPC).
+   * Zero when the chat was never fetched; the LLM then keeps the full window.
+   */
+  unreadCount(token: string | null, chatId: string): Promise<number>
 
   putSettings(token: string | null, payload: SettingsPayload): Promise<void>
   setLlmKey(token: string | null, apiKey: string): Promise<void>

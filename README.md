@@ -5,11 +5,12 @@ pick with a gesture → confirm → send. One WebView serves both surfaces: the
 phone (login and settings) and the glasses (a render target driven by Even Hub
 containers).
 
-**v0.4.0 — real Telegram in the glasses feed.** The phone signs in to Telegram
-through the backend (MTProto, no Bot API stand-in), and the glasses list is the
-account's unread dialogs with their real messages. Still mock: sending from the
-glasses and read marks (v0.6), the LLM's reply options (v0.5), and the demo set
-used before a link exists (`src/api/demo.ts`).
+**v0.5.0 — a working LLM on real conversations.** The phone signs in to Telegram
+through the backend (MTProto, no Bot API stand-in), the glasses list is the
+account's unread dialogs with their real messages, and opening a message fetches
+a real summary and three reply options from the provider configured on the
+backend. Still mock: sending from the glasses and read marks (v0.6), and the
+demo set used before a link exists (`src/api/demo.ts`).
 
 What is real in this version:
 
@@ -21,6 +22,10 @@ What is real in this version:
   bearer token;
 - the backend speaks MTProto through `teleproto`: `GET /chats`,
   `GET /chats/:id/messages`, sessions in SQLite under `backend/data/`;
+- the LLM speaks an OpenAI-compatible API configured by `.env`: three reply
+  options and a summary for the message being answered, in the language of that
+  message, with the tone from T3, cached for 24 hours; a failure is an honest
+  `NO REPLIES`, never invented text;
 - the full glasses UI from v0.1 (20 screens, gestures, native scrolling,
   microphone level) and its measured 27/40 px geometry;
 - one state for both surfaces: `Save` in `Chats` filters the glasses list, the
@@ -130,9 +135,11 @@ implementation is `src/api/client.ts`.
 | `POST` | `/api/auth/logout` | drop the Telegram session |
 | `DELETE` | `/api/data` | remove the session and stored data |
 | `GET` | `/api/chats` | `[{ id, title, preview, unread }]` for T1 and the glasses feed |
-| `GET` | `/api/chats/:id/messages` | last messages of one dialog, oldest first: `[{ id, at, text, out }]` |
+| `GET` | `/api/chats/:id/messages` | last messages of one dialog, oldest first: `[{ id, at, text, out, media? }]` |
 | `PUT` | `/api/settings` | mirror `{ lang, quickReply, tone, selectedChats, llmModel }` for the LLM |
 | `POST` | `/api/llm/key` | `{ apiKey }` — the backend stores the key; the WebView never keeps it |
+| `POST` | `/api/llm/replies` | `{ chatId, messageId }` → `{ summary, replies }`; a failure is 502 `{ error: "llm" }` |
+| `GET` | `/api/llm/models` | `{ models: [{ id, label }], current }` for the T3 picker |
 
 The session token comes back as `token` and is kept in `localStorage` under
 `teleglass.token`; it goes to our backend only, never to Telegram. Errors are
@@ -140,6 +147,17 @@ The session token comes back as `token` and is kept in `localStorage` under
 
 The LLM API key is one-way: it goes to the backend through `/api/llm/key`, the
 field is cleared immediately, and nothing about the key lands in `localStorage`.
+The backend keeps it AES-256-GCM-encrypted (the same key as the Telegram
+session) and never returns it. A key saved from T3 wins over `LLM_API_KEY` in
+`app/.env`; without either, `/api/health` says `llm: "off"` and no request is
+made. Provider, model and the model list are `.env` only:
+
+```
+LLM_BASE_URL=https://api.deepseek.com
+LLM_API_KEY=...
+LLM_MODEL=deepseek-flash
+LLM_MODELS=deepseek-flash,deepseek-v4-pro
+```
 
 The base URL is `VITE_API_BASE` (default: same-origin `/api`). A remote backend
 needs two things: CORS headers for the WebView origin and its domain in

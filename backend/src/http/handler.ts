@@ -15,10 +15,12 @@ import {
 } from '../contract.js'
 import type { Logger } from '../log.js'
 import { errorTag } from '../log.js'
+import type { LlmApi } from '../llm/service.js'
 import type { AuthService } from '../service.js'
 
 export interface HandlerDeps {
   auth: AuthService
+  llm: LlmApi
   log: Logger
   corsOrigins: string[]
 }
@@ -87,8 +89,12 @@ async function dispatch(
   }
 
   switch (route) {
-    case 'GET /health':
-      return json(200, await deps.auth.health())
+    case 'GET /health': {
+      const health = await deps.auth.health()
+      // The LLM status is the LLM's own: a key in the database is not proof
+      // that the provider answers (and `.env` may hold the key instead).
+      return json(200, { ...health, llm: deps.llm.status() })
+    }
 
     case 'GET /auth':
       return json(200, await deps.auth.state(token))
@@ -141,6 +147,17 @@ async function dispatch(
       const apiKey = requireString(body, 'apiKey')
       await deps.auth.setLlmKey(token, apiKey)
       return json(200, { ok: true })
+    }
+
+    case 'GET /llm/models':
+      return json(200, deps.llm.models(token))
+
+    case 'POST /llm/replies': {
+      const body = parseJson(request.body)
+      const chatId = requireString(body, 'chatId')
+      const messageId = requireString(body, 'messageId')
+      if (chatId.length > 96 || messageId.length > 32) throw new ContractError('unknown')
+      return json(200, await deps.llm.replies(token, chatId, messageId))
     }
 
     default:

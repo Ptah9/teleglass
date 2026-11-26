@@ -60,6 +60,7 @@ export function initialState(): AppState {
     phoneMic: false,
     telegramConnected: true,
     phoneRead: null,
+    llmConfigured: false,
     // "now" is honest for the demo empty screen; a real feed replaces it on load.
     lastChecked: timeStr(),
     flash: null,
@@ -162,6 +163,8 @@ export function reduce(s: AppState, e: AppEvent): AppState {
       return s
     case 'feed':
       return onFeed(s, e.status, e.chats, e.merge === true)
+    case 'llmReplies':
+      return onLlmReplies(s, e)
     case 'tick':
       return onTick(s, e.now)
   }
@@ -180,6 +183,12 @@ function onGesture(s: AppState, g: Gesture): AppState {
       return onFulltext(s, g)
     case 'replies':
       return onReplies(s, g)
+    case 'repliesLoading':
+      // Waiting for the LLM: only "back" works, a second request is the retry
+      // on NO REPLIES, not a tap on a skeleton.
+      return g === 'doubleClick'
+        ? { ...s, screen: { kind: 'chat', chatId: s.screen.chatId, msgIndex: s.screen.msgIndex } }
+        : s
     case 'repliesEmpty':
       return onRepliesEmpty(s, g)
     case 'confirm':
@@ -217,14 +226,18 @@ function chatsScreen(s: AppState): AppState {
  * list: a connected account never falls back to the demo set.
  */
 function onFeed(s: AppState, status: FeedStatus, chats: MockChat[] | null, merge: boolean): AppState {
-  const incoming = status === 'ready' ? (chats ?? []) : []
+  const fresh = chats ?? []
+  // The feed re-reads Telegram messages; the reply options and the summary it
+  // already paid for are ours and must survive a refresh (id → id).
+  const incoming =
+    status === 'ready'
+      ? withLlmData(s.chats, merge && s.feedStatus === 'ready' ? withKeptChats(s.chats, fresh) : fresh)
+      : []
   const next =
     status === 'demo'
       ? MOCK_CHATS
       : status === 'ready'
-        ? merge && s.feedStatus === 'ready'
-          ? withKeptChats(s.chats, incoming)
-          : incoming
+        ? incoming
         : []
   if (status === s.feedStatus && next === s.chats) return s
 
@@ -269,6 +282,36 @@ function withKeptChats(old: MockChat[], fresh: MockChat[]): MockChat[] {
   const seen = new Set(fresh.map((chat) => chat.id))
   const kept = old.filter((chat) => !seen.has(chat.id))
   return kept.length === 0 ? fresh : [...fresh, ...kept]
+}
+
+/**
+ * A fresh feed row carries Telegram text only. The summary and the three
+ * options are LLM results that were already paid for, so they are copied onto
+ * the new message with the same composite id (chat id + Telegram id).
+ */
+function withLlmData(old: MockChat[], fresh: MockChat[]): MockChat[] {
+  const byId = new Map<string, MockMessage>()
+  for (const chat of old) {
+    for (const message of chat.messages) {
+      if (message.summary !== undefined || message.replies.length > 0 || message.repliesReady) {
+        byId.set(message.id, message)
+      }
+    }
+  }
+  if (byId.size === 0) return fresh
+  return fresh.map((chat) => ({
+    ...chat,
+    messages: chat.messages.map((message) => {
+      const known = byId.get(message.id)
+      if (!known) return message
+      return {
+        ...message,
+        ...(known.summary === undefined ? {} : { summary: known.summary }),
+        replies: known.replies,
+        ...(known.repliesReady ? { repliesReady: true } : {}),
+      }
+    }),
+  }))
 }
 
 /**
@@ -490,10 +533,26 @@ function toReplies(s: AppState, chatId: string, msgIndex: number): AppState {
   if (!chat) return s
   const msg = unreadMsgs(chat, s.read)[msgIndex]
   if (!msg) return s
-  if (msg.replies.length === 0) {
+  if (msg.replies.length > 0) {
+    return { ...s, screen: { kind: 'replies', chatId, msgIndex, sel: 0 } }
+  }
+  // An empty list without a finished request means "the LLM has not answered
+  // yet", not "there are no options"; the two states are different screens.
+  if (msg.repliesReady) return { ...s, screen: { kind: 'repliesEmpty', chatId, msgIndex } }
+  return beginReplies(s, chatId, msgIndex)
+}
+
+/**
+ * Enter REPLIES asking the WebView for options. No handler, no remote id, no
+ * LLM key or a demo message — the honest empty screen, not a spinner forever.
+ */
+function beginReplies(s: AppState, chatId: string, msgIndex: number): AppState {
+  const chat = chatById(s, chatId)
+  const msg = chat ? unreadMsgs(chat, s.read)[msgIndex] : undefined
+  if (!msg || !msg.remoteId || !s.llmConfigured) {
     return { ...s, screen: { kind: 'repliesEmpty', chatId, msgIndex } }
   }
-  return { ...s, screen: { kind: 'replies', chatId, msgIndex, sel: 0 } }
+  return { ...s, screen: { kind: 'repliesLoading', chatId, msgIndex } }
 }
 
 function onReplies(s: AppState, g: Gesture): AppState {
@@ -540,12 +599,78 @@ function onReplies(s: AppState, g: Gesture): AppState {
 function onRepliesEmpty(s: AppState, g: Gesture): AppState {
   const scr = s.screen
   if (scr.kind !== 'repliesEmpty') return s
-  // ux-flow: double tap — back to CHAT; the footer still promises swipe ↑ back.
-  // Back to the message we came from, not to the first one in the queue.
-  if (g === 'doubleClick' || g === 'swipeUp') {
-    return { ...s, screen: { kind: 'chat', chatId: scr.chatId, msgIndex: scr.msgIndex } }
+  switch (g) {
+    case 'click':
+      // "tap - retry": the second attempt is an explicit gesture, not a loop.
+      return beginReplies(s, scr.chatId, scr.msgIndex)
+    case 'longPress':
+      // On "LLM not configured" the footer is empty by design, so a hidden
+      // long-press must not open SKIP? for a message the user cannot answer.
+      if (!s.llmConfigured) return s
+      return {
+        ...s,
+        screen: {
+          kind: 'skipConfirm',
+          chatId: scr.chatId,
+          msgIndex: scr.msgIndex,
+          from: 'chat',
+        },
+      }
+    case 'doubleClick':
+    case 'swipeUp':
+      // Back to the message we came from, not to the first one in the queue.
+      return { ...s, screen: { kind: 'chat', chatId: scr.chatId, msgIndex: scr.msgIndex } }
+    default:
+      return s
   }
-  return s
+}
+
+/**
+ * The WebView brings the LLM answer. The data lands on the message either way;
+ * the screen follows only if it is still waiting for this very message.
+ */
+function onLlmReplies(
+  s: AppState,
+  e: Extract<AppEvent, { type: 'llmReplies' }>,
+): AppState {
+  const key = `${e.chatId}#${e.messageId}`
+  const oldChat = chatById(s, e.chatId)
+  if (!oldChat) return s
+
+  let touched = false
+  const chats = s.chats.map((chat) => {
+    if (chat.id !== e.chatId) return chat
+    return {
+      ...chat,
+      messages: chat.messages.map((message) => {
+        if (message.id !== key) return message
+        touched = true
+        const summary = e.ok && e.summary.trim().length > 0 ? e.summary : undefined
+        return {
+          ...message,
+          replies: e.ok ? e.replies : [],
+          repliesReady: true,
+          ...(summary === undefined ? {} : { summary }),
+        }
+      }),
+    }
+  })
+  if (!touched) return s
+
+  const next: AppState = { ...s, chats }
+  const scr = s.screen
+  if (scr.kind !== 'repliesLoading' || scr.chatId !== e.chatId) return next
+
+  const chat = chats.find((item) => item.id === e.chatId)
+  const msgs = chat ? unreadMsgs(chat, s.read) : []
+  // The user may have swiped to another message while the request was running.
+  if (msgs[scr.msgIndex]?.id !== key) return next
+  return {
+    ...next,
+    screen: e.ok
+      ? { kind: 'replies', chatId: e.chatId, msgIndex: scr.msgIndex, sel: 0 }
+      : { kind: 'repliesEmpty', chatId: e.chatId, msgIndex: scr.msgIndex },
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ export type AuthErrorCode =
   | 'wrongPassword'
   | 'network'
   | 'linkExpired'
+  | 'llm'
   | 'unknown'
 
 /** An error the WebView can name on the screen, not a stack trace. */
@@ -64,6 +65,27 @@ export interface MessageSummary {
   text: string
   /** Sent by this account; the glasses only present incoming messages. */
   out: boolean
+  /** `text` is a media word, not the author's letters (the LLM language rule). */
+  media?: boolean
+}
+
+/** What the LLM returns for one message. */
+export interface LlmReply {
+  /** ≤ 90 characters; empty for a message that fits the CHAT body. */
+  summary: string
+  /** Exactly three options, each ≤ 120 characters. */
+  replies: string[]
+}
+
+export interface LlmModelInfo {
+  id: string
+  label: string
+}
+
+export interface LlmModels {
+  models: LlmModelInfo[]
+  /** The model the backend would use now (the phone's choice if it is known). */
+  current: string
 }
 
 export interface Api {
@@ -103,6 +125,13 @@ export interface Api {
    * The WebView never stores it: the field is cleared after this call.
    */
   setLlmKey(apiKey: string): Promise<void>
+  /**
+   * Three reply options and a summary for one message. A failure is an honest
+   * `llm` error: the glasses show NO REPLIES instead of invented text.
+   */
+  replies(chatId: string, messageId: string): Promise<LlmReply>
+  /** Models advertised by the backend; `current` is what it would use now. */
+  llmModels(): Promise<LlmModels>
   /** true — the demo implementation is in use (no backend answered). */
   readonly demo: boolean
 }

@@ -30,7 +30,7 @@ import type { Config } from '../config.js'
  */
 export type TgClient = TelegramClient<StringSession>
 
-const APP_VERSION = '0.4.0'
+const APP_VERSION = '0.5.0'
 const CONNECT_TIMEOUT_S = 8
 
 export class ClientRegistry {

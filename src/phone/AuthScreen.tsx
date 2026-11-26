@@ -25,6 +25,9 @@ const ERROR_KEY: Record<AuthErrorCode, Parameters<TFunc>[0]> = {
   wrongPassword: 'phone.auth.error.wrongPassword',
   network: 'phone.auth.error.network',
   linkExpired: 'phone.auth.link.expired',
+  // `llm` never comes from an auth route; if it somehow does, it is not a
+  // wrong code and the generic network line is the honest one.
+  llm: 'phone.auth.error.network',
   unknown: 'phone.auth.error.network',
 }
 

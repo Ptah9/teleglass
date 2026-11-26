@@ -8,6 +8,7 @@
 import { loadConfig, type Config } from './config.js'
 import { Db } from './db.js'
 import { createHttpServer } from './http/server.js'
+import { LlmService } from './llm/service.js'
 import { Logger, describeError } from './log.js'
 import { ClientRegistry } from './tg/clients.js'
 import { TelegramAuthService } from './tg/service.js'
@@ -38,7 +39,9 @@ async function main(): Promise<void> {
   const auth = new TelegramAuthService({ config, db, clients, log })
   auth.boot()
 
-  const server = createHttpServer({ auth, log, corsOrigins: config.corsOrigins })
+  const llm = new LlmService({ config, db, log, auth })
+
+  const server = createHttpServer({ auth, llm, log, corsOrigins: config.corsOrigins })
   let listening = false
   // A failed bind is the most common way this process dies (`EADDRINUSE` when
   // the port is taken). Say why, in words a person can act on, and exit.

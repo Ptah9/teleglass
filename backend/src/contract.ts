@@ -16,6 +16,7 @@ export type AuthErrorCode =
   | 'wrongPassword'
   | 'network'
   | 'linkExpired'
+  | 'llm'
   | 'unknown'
 
 /** `types.ts` `AuthState`. `token` travels only when a login just completed. */
@@ -53,6 +54,29 @@ export interface MessageSummary {
   text: string
   /** Sent by this account. The glasses only show incoming unread messages. */
   out: boolean
+  /**
+   * `text` is a media word (`Photo`, `Voice message`), not the author's text.
+   * The LLM language rule needs it: a media word is not a language.
+   */
+  media?: boolean
+}
+
+/** What the LLM returns for one message (v0.5). */
+export interface LlmReply {
+  /** ≤ 90 chars, word boundary; empty for a message that fits the CHAT body. */
+  summary: string
+  /** Exactly three options, each ≤ 120 chars, no numbering. */
+  replies: string[]
+}
+
+export interface LlmModelInfo {
+  id: string
+  label: string
+}
+
+export interface LlmModels {
+  models: LlmModelInfo[]
+  current: string
 }
 
 export interface SettingsPayload {
@@ -93,6 +117,7 @@ export function isAuthErrorCode(value: unknown): value is AuthErrorCode {
     value === 'wrongPassword' ||
     value === 'network' ||
     value === 'linkExpired' ||
+    value === 'llm' ||
     value === 'unknown'
   )
 }

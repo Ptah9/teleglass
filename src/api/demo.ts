@@ -1,5 +1,6 @@
 import { chatLabel } from '../state/reducer'
 import { MOCK_CHATS } from '../state/data'
+import { DEFAULT_LLM_MODEL, LLM_MODELS } from '../store/llm'
 import { hasDemoFlag } from './demo-flags'
 import {
   AuthError,
@@ -7,6 +8,7 @@ import {
   type AuthState,
   type ChatSummary,
   type Health,
+  type LlmModels,
   type MessageSummary,
 } from './types'
 
@@ -210,6 +212,21 @@ export function createDemoApi(): Api {
       // No backend: the key is deliberately not stored anywhere. The screen
       // says so instead of pretending the key was saved.
       await sleep(400)
+    },
+
+    async replies(): Promise<never> {
+      // There is no LLM behind the demo: the glasses must say NO REPLIES, not
+      // show made-up options. Mock chats keep their own scripted replies.
+      await sleep(200)
+      throw new AuthError('llm')
+    },
+
+    async llmModels(): Promise<LlmModels> {
+      await sleep(120)
+      return {
+        models: LLM_MODELS.map((model) => ({ id: model.id, label: model.label })),
+        current: DEFAULT_LLM_MODEL,
+      }
     },
   }
 }

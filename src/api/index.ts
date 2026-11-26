@@ -83,6 +83,8 @@ export const api: Api = {
   messages: async (chatId) => (await ready()).messages(chatId),
   putSettings: async (payload) => (await ready()).putSettings(payload),
   setLlmKey: async (apiKey) => (await ready()).setLlmKey(apiKey),
+  replies: async (chatId, messageId) => (await ready()).replies(chatId, messageId),
+  llmModels: async () => (await ready()).llmModels(),
 }
 
 /** Demo flags are read synchronously; the screens use this before the probe. */

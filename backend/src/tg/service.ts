@@ -485,7 +485,12 @@ export class TelegramAuthService implements AuthService {
     }
   }
 
-  async messages(token: string | null, chatId: string, limit = 30): Promise<MessageSummary[]> {
+  async messages(
+    token: string | null,
+    chatId: string,
+    limit = 30,
+    withHistory = false,
+  ): Promise<MessageSummary[]> {
     const started = Date.now()
     const session = this.requireSession(token)
     const client = await this.sessionClient(session, this.left(started))
@@ -513,6 +518,26 @@ export class TelegramAuthService implements AuthService {
           // not throw the chat away. Log it and show what was fetched.
           if (isSessionDead(err)) throw err
           this.log.warn('messages.forward.failed', { chatId, rpc: loggableError(err) })
+        }
+      }
+      // The LLM answers a message that may be the first of a one-message unread
+      // block; without the read messages above it the prompt has no conversation
+      // at all (task v0.5 §4 p.7). The glasses never ask for this.
+      if (withHistory && entry.readInboxMaxId > 0) {
+        const anchor = oldestMessageId(rows)
+        if (anchor > 0) {
+          try {
+            const older = await this.wait(
+              client.getMessages(entry.peer, historyQuery(anchor, limit)),
+              this.left(started),
+            )
+            rows = mergeById(rows, older)
+          } catch (err) {
+            // Same rule as the forward walk: the unread window already answers
+            // the screen, so a failed history request must not throw it away.
+            if (isSessionDead(err)) throw err
+            this.log.warn('messages.history.failed', { chatId, rpc: loggableError(err) })
+          }
         }
       }
       // Telegram answers newest first; the CHAT screen pages from the top of the
@@ -544,6 +569,15 @@ export class TelegramAuthService implements AuthService {
       })
       throw contract
     }
+  }
+
+  /**
+   * Unread counter from the dialog cache; no RPC. Zero when the chat has not
+   * been fetched yet, which means "unknown" to the LLM, not "nothing unread".
+   */
+  async unreadCount(token: string | null, chatId: string): Promise<number> {
+    const session = this.requireSession(token)
+    return this.peers.get(this.peerKey(session.id, chatId))?.unread ?? 0
   }
 
   // ---- settings / LLM key -------------------------------------------------
@@ -1056,6 +1090,33 @@ export function messageQuery(entry: PeerEntry, limit: number): { limit: number; 
 }
 
 /**
+ * Older messages below the oldest one already fetched. The LLM needs a
+ * transcript even when the whole unread block is one message
+ * (`task-v0.5-llm.md` §4 p.7).
+ *
+ * The anchor is the oldest fetched id, not the read watermark: `offsetId` is
+ * exclusive and `minId` is exclusive too, so anchoring at the watermark would
+ * drop the watermark message itself - exactly the message the first unread one
+ * answers - and would jump over a gap when the unread window was capped at 100.
+ */
+export function historyQuery(
+  anchorId: number,
+  limit: number,
+): { offsetId: number; limit: number } {
+  const capped = Math.min(Math.max(limit, 1), 50)
+  return { offsetId: anchorId, limit: capped }
+}
+
+/** The oldest real message in a fetched window; 0 when there is none. */
+export function oldestMessageId(messages: Array<{ id: number }>): number {
+  let oldest = 0
+  for (const message of messages) {
+    if (message.id > 0 && (oldest === 0 || message.id < oldest)) oldest = message.id
+  }
+  return oldest
+}
+
+/**
  * The other direction: oldest messages after the read watermark. Used only when
  * the newest window turned out to contain too few incoming messages, so a wall
  * of outgoing ones cannot hide the unread block.
@@ -1092,6 +1153,7 @@ function messageKey(message: Api.TypeMessage): string {
 /** One message for the glasses: a stable id, a real timestamp, the whole text. */
 export function messageSummaryOf(message: Api.Message): MessageSummary {
   const date = typeof message.date === 'number' ? message.date : 0
+  const rawText = (message as { message?: unknown }).message
   return {
     id: String(message.id),
     at: new Date(date * 1000).toISOString(),
@@ -1099,6 +1161,9 @@ export function messageSummaryOf(message: Api.Message): MessageSummary {
     // screen clips it, and FULL TEXT lets the firmware scroll the whole thing.
     text: messageTextOf(message),
     out: message.out === true,
+    // `text` is a media word for a photo/sticker/voice: the LLM language rule
+    // must not read "Photo" as English.
+    media: !(typeof rawText === 'string' && rawText.trim().length > 0),
   }
 }
 

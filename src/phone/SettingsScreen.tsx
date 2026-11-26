@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { Health, StatusLevel } from '../api/types'
+import { HEALTH_EVENT } from '../api/client'
+import type { Health, LlmModelInfo, StatusLevel } from '../api/types'
 import type { Lang, TFunc } from '../i18n'
 import { LLM_MODELS, modelLabel } from '../store/llm'
 import { QUICK_REPLY_MAX, type Settings, type Tone } from '../store/settings'
@@ -56,13 +57,45 @@ export function SettingsScreen({
   const [keyStatus, setKeyStatus] = useState<'saved' | 'demo' | null>(null)
   const [keyError, setKeyError] = useState(false)
   const [modelSheet, setModelSheet] = useState(false)
+  // The list is the backend's (`GET /llm/models`); the static set is the
+  // offline/demo fallback, not a second source of truth.
+  const [models, setModels] = useState<LlmModelInfo[]>(() =>
+    LLM_MODELS.map((model) => ({ id: model.id, label: model.label })),
+  )
+
+  useEffect(() => {
+    let stop = false
+    api
+      .llmModels()
+      .then((result) => {
+        if (stop || result.models.length === 0) return
+        setModels(result.models)
+        // An old model id (from before the provider was chosen) would be sent
+        // with every request and silently replaced by the backend default.
+        if (!result.models.some((model) => model.id === settings.llmModel)) {
+          const next = result.current || result.models[0]?.id
+          if (next) onChange({ llmModel: next })
+        }
+      })
+      .catch(() => undefined)
+    return () => {
+      stop = true
+    }
+  }, [onChange, settings.llmModel])
 
   async function check() {
     setChecking(true)
     try {
-      setHealth(await api.health())
+      const next = await api.health()
+      setHealth(next)
+      // The glasses read `llm` from /health; "Check now" is the manual path
+      // back from "not configured" (the key was added to .env, the backend was
+      // restarted), so they must hear about it without a WebView reload.
+      window.dispatchEvent(new Event(HEALTH_EVENT))
     } catch {
-      setHealth({ backend: 'error', llm: 'off', checkedAt: new Date().toISOString() })
+      // The backend did not answer: "error", not "off". `off` means "no key",
+      // and claiming that without an answer is a lie the glasses do not make.
+      setHealth({ backend: 'error', llm: 'error', checkedAt: new Date().toISOString() })
     } finally {
       setChecking(false)
     }
@@ -81,7 +114,8 @@ export function SettingsScreen({
       })
       .catch(() => {
         if (stop) return
-        setHealth({ backend: 'error', llm: 'off', checkedAt: new Date().toISOString() })
+        // Same rule as `check()`: no answer is "error", not "not configured".
+        setHealth({ backend: 'error', llm: 'error', checkedAt: new Date().toISOString() })
         setChecking(false)
       })
     return () => {
@@ -130,6 +164,9 @@ export function SettingsScreen({
       // One-way by design: the field does not keep the secret after sending.
       setLlmKey('')
       setKeyStatus(api.demo ? 'demo' : 'saved')
+      // The glasses pick "not configured" from /health; `check` tells them
+      // about the new status without reloading the WebView.
+      void check()
     } catch {
       setKeyError(true)
     } finally {
@@ -140,6 +177,8 @@ export function SettingsScreen({
   const quickReply = settings.quickReply
   const quickReplyEmpty = quickReply.trim().length === 0
   const telegramLevel: StatusLevel = settings.telegram ? 'ok' : 'off'
+  const currentModelLabel =
+    models.find((model) => model.id === settings.llmModel)?.label ?? modelLabel(settings.llmModel)
 
   return (
     <div className="phone__main">
@@ -235,7 +274,7 @@ export function SettingsScreen({
               onClick={() => setModelSheet(true)}
             >
               <span>{t('phone.llm.model')}</span>
-              <span className="picker-trigger__value">{modelLabel(settings.llmModel)}</span>
+              <span className="picker-trigger__value">{currentModelLabel}</span>
             </button>
           </div>
         </section>
@@ -340,7 +379,7 @@ export function SettingsScreen({
       ) : null}
       {modelSheet ? (
         <Sheet title={t('phone.llm.model')} onClose={() => setModelSheet(false)}>
-          {LLM_MODELS.map((model) => (
+          {models.map((model) => (
             <button
               key={model.id}
               type="button"

@@ -1,7 +1,7 @@
 import { makeT } from '../i18n'
 import { buildView, type View } from '../view/build'
 import { createTarget, type GlassesTarget, type MenuItem } from './adapter'
-import { initialState, reduce, visibleChats } from '../state/reducer'
+import { chatById, initialState, reduce, unreadMsgs, visibleChats } from '../state/reducer'
 import type {
   AppEvent,
   AppState,
@@ -46,6 +46,8 @@ export interface GlassesSettings {
   quickReply: string
   telegramConnected: boolean
   selectedChats: string[] | null
+  /** Backend has an LLM key: REPLIES may ask for options. */
+  llmConfigured: boolean
 }
 
 export interface Page {
@@ -63,6 +65,14 @@ export interface Page {
    * calls `applyChats` with the result. `null` removes the handler.
    */
   onRefresh(cb: (() => void) | null): void
+  /** REPLIES opened on a real message and needs options from the backend. */
+  onReplies(cb: ((chatId: string, messageId: string) => void) | null): void
+  /** The LLM answered (or refused): options for one message, `null` = failed. */
+  applyReplies(
+    chatId: string,
+    messageId: string,
+    result: { summary: string; replies: string[] } | null,
+  ): void
   subscribe(cb: (s: AppState) => void): () => void
   state(): AppState
   /** true — the page lives inside Even App (glasses), false — browser. */
@@ -77,6 +87,10 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   let lastSwipe = 0
   /** Set by the WebView: it owns `fetch`, the page only says "data is stale". */
   let refreshHandler: (() => void) | null = null
+  /** Set by the WebView: it fetches LLM options, the page shows the skeleton. */
+  let replyHandler: ((chatId: string, messageId: string) => void) | null = null
+  /** Requests already sent, so a tick does not ask twice for one message. */
+  const repliesInFlight = new Set<string>()
 
   function menuItems(): MenuItem[] {
     const t = makeT(s.lang)
@@ -247,6 +261,29 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
 
     requestRender()
     for (const l of [...listeners]) l(s)
+    maybeRequestReplies()
+  }
+
+  /**
+   * REPLIES opens on a skeleton and asks the WebView for options. The page owns
+   * the decision (configured? real message?), the WebView owns the request; the
+   * in-flight set keeps the 200 ms tick from asking twice for one message.
+   */
+  function maybeRequestReplies(): void {
+    const scr = s.screen
+    if (scr.kind !== 'repliesLoading') return
+    const chat = chatById(s, scr.chatId)
+    const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
+    if (!msg?.remoteId || replyHandler === null) {
+      // Nothing to ask: never leave the skeleton spinning forever.
+      console.warn('[teleglass] replies were requested with no way to fetch them')
+      publish(reduce(s, { type: 'gesture', gesture: 'doubleClick' }))
+      return
+    }
+    const key = `${scr.chatId}#${msg.remoteId}`
+    if (repliesInFlight.has(key)) return
+    repliesInFlight.add(key)
+    replyHandler(scr.chatId, msg.remoteId)
   }
 
   /**
@@ -372,6 +409,47 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     refreshHandler = cb
   }
 
+  function onReplies(cb: ((chatId: string, messageId: string) => void) | null): void {
+    replyHandler = cb
+  }
+
+  function applyReplies(
+    chatId: string,
+    messageId: string,
+    result: { summary: string; replies: string[] } | null,
+  ): void {
+    repliesInFlight.delete(`${chatId}#${messageId}`)
+    const ok = result !== null && result.replies.length === 3
+    const next = reduce(s, {
+      type: 'llmReplies',
+      chatId,
+      messageId,
+      ok,
+      summary: result?.summary ?? '',
+      replies: result?.replies ?? [],
+    })
+    if (next === s) {
+      // The message left the feed while the request ran (the phone read the chat
+      // or the feed refreshed). Nothing will show and no new request will start,
+      // so do not leave the skeleton on screen: go back to the chat, as the
+      // double tap would. If the screen already moved to another message of the
+      // same chat, that message has its own request - leave it alone.
+      if (s.screen.kind === 'repliesLoading' && s.screen.chatId === chatId) {
+        const chat = chatById(s, chatId)
+        const shown = chat ? unreadMsgs(chat, s.read)[s.screen.msgIndex] : undefined
+        const busy = shown?.remoteId
+          ? repliesInFlight.has(`${chatId}#${shown.remoteId}`)
+          : false
+        if (!busy) {
+          console.warn('[teleglass] replies arrived for a message no longer in the feed')
+          publish(reduce(s, { type: 'gesture', gesture: 'doubleClick' }))
+        }
+      }
+      return
+    }
+    publish(next)
+  }
+
   // First screen and ticks. StrictMode mounts components twice —
   // createPage is called once per page (see App.tsx).
   requestRender()
@@ -383,6 +461,8 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     applySettings,
     applyChats,
     onRefresh,
+    onReplies,
+    applyReplies,
     subscribe(cb) {
       listeners.add(cb)
       return () => {
@@ -412,6 +492,7 @@ function mergeSettings(s: AppState, v: GlassesSettings): AppState {
 
   if (next.lang !== v.lang) next = { ...next, lang: v.lang }
   if (next.quickReplyText !== v.quickReply) next = { ...next, quickReplyText: v.quickReply }
+  if (next.llmConfigured !== v.llmConfigured) next = { ...next, llmConfigured: v.llmConfigured }
 
   if (next.telegramConnected !== v.telegramConnected) {
     next = v.telegramConnected

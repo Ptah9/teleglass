@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
-import { UNAUTHORIZED_EVENT } from './api/client'
+import { HEALTH_EVENT, UNAUTHORIZED_EVENT } from './api/client'
 import { hasDemoFlag } from './api/demo-flags'
 import { DebugPanel } from './dev/DebugPanel'
 import { loadFeed } from './even/feed'
@@ -19,11 +19,12 @@ import { loadSettings, saveSettings, type Settings } from './store/settings'
  * `?dev=1` swaps the phone surface for the glasses debug panel used during
  * development and by the simulator scripts.
  */
-const toGlasses = (s: Settings) => ({
+const toGlasses = (s: Settings, llmConfigured: boolean) => ({
   lang: s.lang,
   quickReply: s.quickReply.trim().length > 0 ? s.quickReply : MOCK_QUICK_REPLY,
   telegramConnected: s.telegram,
   selectedChats: s.selectedChats,
+  llmConfigured,
 })
 
 export default function App() {
@@ -42,6 +43,11 @@ export default function App() {
     return hasDemoFlag('connected') ? { ...loaded, telegram: true } : loaded
   }, [])
   const [settings, setSettings] = useState<Settings>(bootSettings)
+  // Optimistic before the first /health: `false` would show "LLM not
+  // configured" for a second after boot and turn a tap into a dead end. If the
+  // key is really missing, the request answers 502 in milliseconds and the
+  // honest NO REPLIES screen appears.
+  const [llmConfigured, setLlmConfigured] = useState(!api.demo)
   const [native, setNative] = useState<boolean | null>(null)
   const [bootFailed, setBootFailed] = useState(false)
   /** One feed request at a time: the empty-CHATS tap and foreground can race. */
@@ -55,7 +61,7 @@ export default function App() {
   useEffect(() => {
     let alive = true
     let stop: (() => void) | undefined
-    getPage(toGlasses(bootSettings))
+    getPage(toGlasses(bootSettings, !api.demo))
       .then((p) => {
         if (!alive) return
         setPage(p)
@@ -84,8 +90,8 @@ export default function App() {
     telegramNow.current = settings.telegram
     if (!page) return
     saveSettings(settings)
-    page.applySettings(toGlasses(settings))
-  }, [page, settings])
+    page.applySettings(toGlasses(settings, llmConfigured))
+  }, [page, settings, llmConfigured])
 
   /**
    * Real chats for the glasses. The page cannot fetch, so the WebView does it
@@ -147,6 +153,50 @@ export default function App() {
     page.onRefresh(() => void reloadFeed())
     return () => page.onRefresh(null)
   }, [page, reloadFeed])
+
+  /**
+   * REPLIES asks for options; the WebView owns the request. A failure (timeout,
+   * 502, no key) is passed as `null`, and the page shows NO REPLIES — the same
+   * screen as a real empty answer, never invented text.
+   */
+  useEffect(() => {
+    if (!page) return
+    page.onReplies((chatId, messageId) => {
+      void api
+        .replies(chatId, messageId)
+        .then((result) => page.applyReplies(chatId, messageId, result))
+        .catch((err: unknown) => {
+          console.warn('[teleglass] replies were not generated:', err)
+          page.applyReplies(chatId, messageId, null)
+        })
+    })
+    return () => page.onReplies(null)
+  }, [page])
+
+  /**
+   * Does the backend have an LLM? `off` means no key: REPLIES must say "LLM not
+   * configured" and make no request. T3 announces a saved key through
+   * HEALTH_EVENT, so the glasses do not need a WebView restart to notice it.
+   */
+  useEffect(() => {
+    let stop = false
+    const load = () => {
+      api
+        .health()
+        .then((h) => {
+          if (stop) return
+          setLlmConfigured(!api.demo && h.llm !== 'off')
+        })
+        .catch(() => undefined)
+    }
+    void load()
+    const onHealth = () => void load()
+    window.addEventListener(HEALTH_EVENT, onHealth)
+    return () => {
+      stop = true
+      window.removeEventListener(HEALTH_EVENT, onHealth)
+    }
+  }, [])
 
   // The saved "Telegram connected" flag can outlive the backend session — that
   // is exactly how the tabs once covered a 401. One check on boot drops the

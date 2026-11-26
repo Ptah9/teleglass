@@ -1,7 +1,7 @@
 import type { TFunc } from '../i18n'
 import { chatById, chatLabel, unreadMsgs, visibleChats } from '../state/reducer'
 import type { AppState, Screen } from '../state/types'
-import { clipLines, cutChars, cutToChars, cutToPx, lineCount, textWidth } from '../state/wrap'
+import { clipLines, cutBytes, cutChars, cutToChars, cutToPx, byteLength, lineCount, textWidth } from '../state/wrap'
 import * as LINES from '../state/limits'
 import { stamp } from './stamp'
 import { BORDER, LIST_ROWS, LIST_ROW, LVL, SLOT } from './geometry'
@@ -53,6 +53,12 @@ const SUMMARY_LINES = LINES.SUMMARY_LINES
 const FULLTEXT_MAX_CHARS = LINES.FULLTEXT_MAX_CHARS
 /** A list row is capped at 64 characters (design-system.md §2, display.md). */
 const LIST_ITEM_CHARS = 64
+/**
+ * The firmware rejects a list item above 63 UTF-8 bytes (simulator 26.11.2026,
+ * `RebuildPageContainer validation failed: list item text length 79 exceeds
+ * limit of 63 bytes`). Cyrillic is two bytes per letter, so this is the real cap.
+ */
+const LIST_ITEM_BYTES = 63
 
 /**
  * LISTENING indicator: the official block ramp (design-guidelines § Glyphs).
@@ -125,6 +131,8 @@ export function buildView(s: AppState, t: TFunc): View {
       return fulltextView(s, t)
     case 'replies':
       return repliesView(s, t)
+    case 'repliesLoading':
+      return repliesLoadingView(t)
     case 'repliesEmpty':
       return repliesEmptyView(s, t)
     case 'confirm':
@@ -225,11 +233,13 @@ function chatsView(s: AppState, t: TFunc): View {
     // cap is the platform's own item limit, so it bounds the whole item too.
     const tail = t('chats.row', { chat: '', time, n }) + suffix
     const room = Math.max(1, SLOT.body.w - textWidth(tail))
-    const name = cutChars(
-      chatLabel(c).toUpperCase(),
-      Math.max(4, LIST_ITEM_CHARS - [...tail].length),
+    // The whole row must stay under the firmware's byte cap: give the name
+    // whatever the time, counter and suffix leave.
+    const name = cutToPx(
+      cutBytes(chatLabel(c).toUpperCase(), Math.max(4, LIST_ITEM_BYTES - byteLength(tail))),
+      room,
     )
-    return t('chats.row', { chat: cutToPx(name, room), time, n }) + suffix
+    return cutBytes(t('chats.row', { chat: name, time, n }) + suffix, LIST_ITEM_BYTES)
   })
 
   const texts = textsOf([
@@ -364,7 +374,15 @@ function repliesView(s: AppState, t: TFunc): View {
 
   // "Say it" is the mandatory second way into voice (design-system.md §5.1):
   // the OS may take the long press for its own menu, the tap always remains.
-  const items = [...msg.replies, t('options.sayIt')]
+  const items = [
+    ...msg.replies.map((reply) =>
+      cutBytes(
+        cutToPx(cutChars(reply, LIST_ITEM_CHARS), SLOT.body.w - 24),
+        LIST_ITEM_BYTES,
+      ),
+    ),
+    cutBytes(t('options.sayIt'), LIST_ITEM_BYTES),
+  ]
 
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('options.title'), level: LVL.main },
@@ -381,12 +399,40 @@ function repliesView(s: AppState, t: TFunc): View {
   return { shape: shapeOf(texts, list), texts, list }
 }
 
-function repliesEmptyView(_s: AppState, t: TFunc): View {
+/**
+ * Waiting for the LLM. Three block lines, no list: an empty REPLIES screen
+ * would look like "no options" while the request is still running.
+ */
+function repliesLoadingView(t: TFunc): View {
+  const texts = textsOf([
+    { id: 'title', slot: 'title', content: t('options.title'), level: LVL.main },
+    dividerSpec('divider'),
+    {
+      id: 'body',
+      slot: 'body',
+      content: '▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n▄▄▄▄▄▄▄▄\n▄▄▄▄▄▄▄▄▄▄▄',
+      level: LVL.caption,
+      capture: true,
+    },
+    { id: 'footer', slot: 'footer', content: '', level: LVL.caption },
+  ])
+  return { shape: shapeOf(texts), texts }
+}
+
+function repliesEmptyView(s: AppState, t: TFunc): View {
+  // Without a key the screen says what is missing instead of offering "retry"
+  // on a request that cannot succeed (§6 of the task).
+  const body = s.llmConfigured ? ' ' : t('replies.notConfigured')
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('replies.emptyTitle'), level: LVL.main },
     dividerSpec('divider'),
-    { id: 'body', slot: 'body', content: ' ', level: LVL.body, capture: true },
-    { id: 'footer', slot: 'footer', content: t('replies.emptyHint'), level: LVL.caption },
+    { id: 'body', slot: 'body', content: body, level: LVL.body, capture: true },
+    {
+      id: 'footer',
+      slot: 'footer',
+      content: s.llmConfigured ? t('replies.emptyHint') : '',
+      level: LVL.caption,
+    },
   ])
   return { shape: shapeOf(texts), texts }
 }

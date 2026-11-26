@@ -63,6 +63,28 @@ function makeService(overrides = {}) {
   return { service, calls }
 }
 
+function makeLlm(overrides = {}) {
+  const calls = []
+  const llm = {
+    status() {
+      return 'off'
+    },
+    models(token) {
+      calls.push(['models', token])
+      return {
+        models: [{ id: 'deepseek-flash', label: 'DeepSeek Flash' }],
+        current: 'deepseek-flash',
+      }
+    },
+    async replies(token, chatId, messageId) {
+      calls.push(['replies', token, chatId, messageId])
+      return { summary: 's', replies: ['a', 'b', 'c'] }
+    },
+    ...overrides,
+  }
+  return { llm, calls }
+}
+
 function request(method, path, { token, body, origin } = {}) {
   const headers = {}
   if (token) headers.authorization = `Bearer ${token}`
@@ -70,8 +92,8 @@ function request(method, path, { token, body, origin } = {}) {
   return { method, path, headers, body: body === undefined ? '' : body }
 }
 
-function deps(service, corsOrigins = ['http://localhost:5173']) {
-  return { auth: service, log: silent, corsOrigins }
+function deps(service, corsOrigins = ['http://localhost:5173'], llm = makeLlm().llm) {
+  return { auth: service, llm, log: silent, corsOrigins }
 }
 
 test('GET /health answers the probe', async () => {
@@ -82,6 +104,79 @@ test('GET /health answers the probe', async () => {
   const body = JSON.parse(response.body)
   assert.equal(body.backend, 'ok')
   assert.equal(body.llm, 'off')
+})
+
+test('/health takes the LLM status from the LLM, not from a stored key', async () => {
+  const { service } = makeService()
+  for (const level of ['ok', 'error', 'off']) {
+    const { llm } = makeLlm({
+      status() {
+        return level
+      },
+    })
+    const response = await handle(deps(service, undefined, llm), request('GET', '/health'))
+    assert.equal(response.status, 200)
+    assert.equal(JSON.parse(response.body).llm, level)
+  }
+})
+
+test('GET /llm/models lists the provider models and the chosen one', async () => {
+  const { service } = makeService()
+  const { llm, calls } = makeLlm()
+  const response = await handle(deps(service, undefined, llm), request('GET', '/llm/models', { token: 't' }))
+  assert.equal(response.status, 200)
+  assert.deepEqual(JSON.parse(response.body), {
+    models: [{ id: 'deepseek-flash', label: 'DeepSeek Flash' }],
+    current: 'deepseek-flash',
+  })
+  assert.deepEqual(calls[0], ['models', 't'])
+})
+
+test('POST /llm/replies passes both ids and returns three options', async () => {
+  const { service } = makeService()
+  const { llm, calls } = makeLlm()
+  const response = await handle(
+    deps(service, undefined, llm),
+    request('POST', '/llm/replies', {
+      token: 't',
+      body: JSON.stringify({ chatId: 'user:1', messageId: '42' }),
+    }),
+  )
+  assert.equal(response.status, 200)
+  assert.deepEqual(JSON.parse(response.body), { summary: 's', replies: ['a', 'b', 'c'] })
+  assert.deepEqual(calls.at(-1), ['replies', 't', 'user:1', '42'])
+})
+
+test('a broken replies request is 400 and never reaches the LLM', async () => {
+  const { service } = makeService()
+  const { llm, calls } = makeLlm()
+  for (const body of ['{', '[]', '{"chatId":"user:1"}', '{"chatId":"","messageId":"1"}']) {
+    const response = await handle(
+      deps(service, undefined, llm),
+      request('POST', '/llm/replies', { token: 't', body }),
+    )
+    assert.equal(response.status, 400)
+    assert.deepEqual(JSON.parse(response.body), { error: 'unknown' })
+  }
+  assert.equal(calls.length, 0)
+})
+
+test('an LLM refusal is 502 llm — the screen shows NO REPLIES', async () => {
+  const { service } = makeService()
+  const { llm } = makeLlm({
+    async replies() {
+      throw new ContractError('llm', 502)
+    },
+  })
+  const response = await handle(
+    deps(service, undefined, llm),
+    request('POST', '/llm/replies', {
+      token: 't',
+      body: JSON.stringify({ chatId: 'user:1', messageId: '42' }),
+    }),
+  )
+  assert.equal(response.status, 502)
+  assert.deepEqual(JSON.parse(response.body), { error: 'llm' })
 })
 
 test('/api prefix is accepted, and GET /auth is idle without a token', async () => {

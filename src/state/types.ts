@@ -48,6 +48,18 @@ export type AppEvent =
    * `merge` keeps chats that this (incomplete) snapshot did not carry.
    */
   | { type: 'feed'; status: FeedStatus; chats: MockChat[] | null; merge?: boolean }
+  /**
+   * The WebView fetched reply options for one message. `null`-ish (`ok: false`)
+   * is an honest failure: the message keeps an empty list and REPLIES says so.
+   */
+  | {
+      type: 'llmReplies'
+      chatId: string
+      messageId: string
+      ok: boolean
+      summary: string
+      replies: string[]
+    }
   | { type: 'tick'; now: number }
 
 /** Message from Telegram. A mock in v0.1; the summary field appears when the text is long. */
@@ -59,6 +71,10 @@ export interface MockMessage {
   summary?: string
   /** Empty array = NO REPLIES screen. */
   replies: string[]
+  /** Telegram's own id inside the chat; absent for demo messages. */
+  remoteId?: string
+  /** The LLM already answered (possibly with nothing). `true` = no retry loop. */
+  repliesReady?: boolean
 }
 
 export interface MockChat {
@@ -87,6 +103,8 @@ export type Screen =
   | { kind: 'chatEmpty'; chatId: string }
   | { kind: 'fulltext'; chatId: string; msgIndex: number }
   | { kind: 'replies'; chatId: string; msgIndex: number; sel: number }
+  /** Waiting for the LLM: three skeleton lines, not an empty screen. */
+  | { kind: 'repliesLoading'; chatId: string; msgIndex: number }
   | { kind: 'repliesEmpty'; chatId: string; msgIndex: number }
   | {
       kind: 'confirm'
@@ -173,6 +191,11 @@ export interface AppState {
    * lands on CHAT with nothing unread.
    */
   phoneRead: string | null
+  /**
+   * The backend has an LLM key (from T3 or `.env`). Without it REPLIES goes
+   * straight to "LLM not configured" and no request is made.
+   */
+  llmConfigured: boolean
   lastChecked: string
   /**
    * Flashing CHATS footer line: `sent · X` for 2 seconds,

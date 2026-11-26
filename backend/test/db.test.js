@@ -118,6 +118,7 @@ test('wipeAll removes sessions, tokens, settings, llm key and pending', () => {
       1,
     )
     db.putLlmKey('v1:x:y:z', 1)
+    db.putLlmCache('cache-key', 'short', ['a', 'b', 'c'], 1)
     db.addFutureToken('token', 's1', 1)
     db.putPending({
       id: 'p1',
@@ -129,14 +130,40 @@ test('wipeAll removes sessions, tokens, settings, llm key and pending', () => {
       created_at: 1,
     })
     assert.equal(db.hasLlmKey(), true)
+    assert.ok(db.getLlmCache('cache-key', 0))
 
     db.wipeAll()
 
     assert.equal(db.hasLlmKey(), false)
+    assert.equal(db.getLlmCache('cache-key', 0), null)
     assert.equal(db.getSession('s1'), null)
     assert.equal(db.sessionIdByTokenHash('hash'), null)
     assert.equal(db.countPending(), 0)
     assert.deepEqual(db.futureTokens(), [])
+  } finally {
+    db.close()
+  }
+})
+
+test('the LLM cache honours its TTL and does not outlive the session', () => {
+  const db = new Db(':memory:')
+  try {
+    db.saveSession({
+      id: 's1',
+      user_id: '1',
+      first_name: '',
+      username: '',
+      enc_session: 'v1:a:b:c',
+      test_dc: 0,
+      created_at: 1,
+    })
+    db.putLlmCache('k', 's', ['a', 'b', 'c'], 1000)
+    assert.deepEqual(db.getLlmCache('k', 0), { summary: 's', replies: ['a', 'b', 'c'] })
+    // Older than the 24 h window: not served.
+    assert.equal(db.getLlmCache('k', 2000), null)
+
+    db.deleteSession('s1')
+    assert.equal(db.getLlmCache('k', 0), null)
   } finally {
     db.close()
   }

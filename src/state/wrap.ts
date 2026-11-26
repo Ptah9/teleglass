@@ -104,6 +104,29 @@ export function textWidth(text: string): number {
   return getTextWidth(text)
 }
 
+const ENCODER = new TextEncoder()
+
+/** UTF-8 length — what a native list item is actually limited by. */
+export function byteLength(text: string): number {
+  return ENCODER.encode(text).length
+}
+
+/**
+ * Cut to a UTF-8 byte budget, ellipsis inside it. The firmware rejects a list
+ * item longer than 63 bytes (`RebuildPageContainer validation failed: list item
+ * text length 79 exceeds limit of 63 bytes`, simulator 26.11.2026), and Cyrillic
+ * takes two bytes per letter — 64 characters is not 64 bytes.
+ */
+export function cutBytes(text: string, max: number): string {
+  if (byteLength(text) <= max) return text
+  let out = ''
+  for (const char of text) {
+    if (byteLength(`${out}${char}…`) > max) break
+    out += char
+  }
+  return out.length > 0 ? `${out}…` : '…'
+}
+
 /**
  * Cut a message body to the container's character limit at the last word
  * boundary (`docs/md/02-build/03-display.md` § Content limits: 1000 for

@@ -133,8 +133,10 @@ function toMessage(chatId: string, message: MessageSummary): MockMessage {
     id: `${chatId}#${message.id}`,
     at: message.at,
     text: message.text,
-    // Reply options are the LLM's job (v0.5): an empty list is the honest state
-    // and the screen says so (NO REPLIES), it does not invent options.
+    // The LLM is asked by Telegram's own id, not by our composite key.
+    remoteId: message.id,
+    // Reply options are the LLM's job (v0.5): an empty list means "not asked
+    // yet"; the page opens REPLIES with a skeleton and a real request.
     replies: [],
   }
 }

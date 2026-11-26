@@ -37,6 +37,19 @@ export interface PendingRow {
   created_at: number
 }
 
+export interface SettingsRow {
+  lang: string
+  quick_reply: string
+  tone: string
+  selected_chats: string | null
+  llm_model: string
+}
+
+export interface CachedReply {
+  summary: string
+  replies: string[]
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS session (
   id TEXT PRIMARY KEY,
@@ -86,6 +99,13 @@ CREATE TABLE IF NOT EXISTS pending (
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS llm_cache (
+  cache_key TEXT PRIMARY KEY,
+  summary TEXT NOT NULL,
+  replies TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `
 
 export class Db {
@@ -122,6 +142,11 @@ export class Db {
         this.db.prepare('DELETE FROM auth_token WHERE session_id = ?').run(other.id)
       }
       this.db.prepare('DELETE FROM session WHERE id <> ?').run(row.id)
+      if (others.length > 0) {
+        // Replacing the account must not leave another login's message text in
+        // the LLM cache; `deleteSession` makes the same promise.
+        this.db.exec('DELETE FROM llm_cache')
+      }
       this.db
         .prepare(
           `INSERT INTO session (id, user_id, first_name, username, enc_session, test_dc, created_at)
@@ -155,6 +180,9 @@ export class Db {
       this.db.prepare('DELETE FROM auth_token WHERE session_id = ?').run(id)
       this.db.prepare('DELETE FROM settings WHERE session_id = ?').run(id)
       this.db.prepare('DELETE FROM session WHERE id = ?').run(id)
+      // The cache holds message-derived text; it must not outlive the account
+      // and be served to a different login.
+      this.db.exec('DELETE FROM llm_cache')
     })
   }
 
@@ -249,6 +277,14 @@ export class Db {
       )
   }
 
+  /** Settings the LLM needs: tone, language fallback, model. */
+  getSettings(sessionId: string): SettingsRow | null {
+    const row = this.db
+      .prepare('SELECT lang, quick_reply, tone, selected_chats, llm_model FROM settings WHERE session_id = ?')
+      .get(sessionId)
+    return (row as unknown as SettingsRow | undefined) ?? null
+  }
+
   // ---- LLM key -----------------------------------------------------------
 
   putLlmKey(encrypted: string, now: number): void {
@@ -260,9 +296,51 @@ export class Db {
       .run(encrypted, now)
   }
 
+  /** The AES-GCM blob, never the plaintext key. */
+  getLlmKey(): string | null {
+    const row = this.db.prepare('SELECT enc_key FROM llm_key WHERE id = 1').get() as unknown as
+      | { enc_key: string }
+      | undefined
+    return row?.enc_key ?? null
+  }
+
   hasLlmKey(): boolean {
     const row = this.db.prepare('SELECT 1 AS one FROM llm_key WHERE id = 1').get()
     return row !== undefined
+  }
+
+  // ---- LLM reply cache ---------------------------------------------------
+
+  getLlmCache(cacheKey: string, minCreatedAt: number): CachedReply | null {
+    const row = this.db
+      .prepare('SELECT summary, replies, created_at FROM llm_cache WHERE cache_key = ?')
+      .get(cacheKey) as unknown as
+      | { summary: string; replies: string; created_at: number }
+      | undefined
+    if (!row || row.created_at < minCreatedAt) return null
+    try {
+      const replies = JSON.parse(row.replies) as unknown
+      if (!Array.isArray(replies) || replies.some((item) => typeof item !== 'string')) return null
+      return { summary: row.summary, replies: replies as string[] }
+    } catch {
+      return null
+    }
+  }
+
+  putLlmCache(cacheKey: string, summary: string, replies: string[], now: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO llm_cache (cache_key, summary, replies, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(cache_key) DO UPDATE SET
+           summary = excluded.summary,
+           replies = excluded.replies,
+           created_at = excluded.created_at`,
+      )
+      .run(cacheKey, summary, JSON.stringify(replies), now)
+  }
+
+  deleteExpiredLlmCache(before: number): void {
+    this.db.prepare('DELETE FROM llm_cache WHERE created_at < ?').run(before)
   }
 
   // ---- future auth tokens ------------------------------------------------
@@ -297,6 +375,7 @@ export class Db {
       this.db.exec('DELETE FROM auth_token')
       this.db.exec('DELETE FROM settings')
       this.db.exec('DELETE FROM llm_key')
+      this.db.exec('DELETE FROM llm_cache')
       this.db.exec('DELETE FROM future_token')
       this.db.exec('DELETE FROM pending')
       this.db.exec('DELETE FROM session')

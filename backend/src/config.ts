@@ -29,6 +29,17 @@ export interface Config {
   socksProxy: string | null
   /** `host:port:secret` for a Telegram MTProxy. */
   mtProxy: string | null
+  /**
+   * OpenAI-compatible LLM endpoint. `null` when the deployment has no LLM —
+   * then `/health` says `llm: "off"` and no request ever leaves the machine.
+   */
+  llmBaseUrl: string | null
+  /** Fallback key from `.env`; a key saved from T3 wins over it. */
+  llmApiKey: string | null
+  /** Model used when the phone has not chosen one (or chose an unknown id). */
+  llmModel: string | null
+  /** Models offered to T3, in `.env` order. */
+  llmModels: string[]
 }
 
 export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -66,6 +77,19 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error('Set either TG_PROXY or TG_MT_PROXY, not both')
   }
 
+  const llmBaseUrl = emptyToNull(env.LLM_BASE_URL)
+  if (llmBaseUrl && !/^https?:\/\//i.test(llmBaseUrl)) {
+    throw new Error('LLM_BASE_URL must start with http:// or https://')
+  }
+
+  const llmModels = (env.LLM_MODELS ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0 && value.length <= 64)
+    .slice(0, 20)
+  const llmModel = emptyToNull(env.LLM_MODEL) ?? llmModels[0] ?? null
+  if (llmModel && !llmModels.includes(llmModel)) llmModels.unshift(llmModel)
+
   return {
     apiId,
     apiHash,
@@ -77,6 +101,10 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
     encKey,
     socksProxy,
     mtProxy,
+    llmBaseUrl,
+    llmApiKey: emptyToNull(env.LLM_API_KEY),
+    llmModel,
+    llmModels,
   }
 }
 

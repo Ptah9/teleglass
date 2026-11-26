@@ -4,9 +4,11 @@ import {
   chatIdOf,
   chatSummaryOf,
   forwardQuery,
+  historyQuery,
   messageQuery,
   messageSummaryOf,
   normalizePhone,
+  oldestMessageId,
   prettyPhone,
 } from '../dist/tg/service.js'
 
@@ -80,6 +82,17 @@ test('without a watermark the newest messages are the fallback', () => {
   assert.deepEqual(messageQuery({ peer: {}, readInboxMaxId: 0, unread: 5 }, 500), { limit: 50 })
 })
 
+test('the LLM history walks back from the oldest fetched message, capped', () => {
+  assert.deepEqual(historyQuery(500, 30), { offsetId: 500, limit: 30 })
+  assert.deepEqual(historyQuery(500, 500), { offsetId: 500, limit: 50 })
+  assert.deepEqual(historyQuery(500, 0), { offsetId: 500, limit: 1 })
+})
+
+test('the history anchor is the oldest fetched id, not the newest', () => {
+  assert.equal(oldestMessageId([{ id: 12 }, { id: 7 }, { id: 0 }]), 7)
+  assert.equal(oldestMessageId([]), 0)
+})
+
 test('a message becomes an ISO stamp, its own newlines and an out flag', () => {
   assert.deepEqual(
     messageSummaryOf({
@@ -93,6 +106,7 @@ test('a message becomes an ISO stamp, its own newlines and an out flag', () => {
       at: '2023-11-14T22:13:20.000Z',
       text: 'hi\nthere',
       out: false,
+      media: false,
     },
   )
 })
@@ -112,6 +126,8 @@ test('media is a word on the glasses, never an empty body', () => {
   })
   assert.equal(message.text, 'Photo')
   assert.equal(message.out, true)
+  // A media word is not the author's text: the language rule must skip it.
+  assert.equal(message.media, true)
 })
 
 test('phone numbers are normalised and pretty-printed', () => {

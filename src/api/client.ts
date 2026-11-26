@@ -5,6 +5,8 @@ import {
   type AuthState,
   type ChatSummary,
   type Health,
+  type LlmModels,
+  type LlmReply,
   type MessageSummary,
 } from './types'
 
@@ -26,6 +28,8 @@ import {
  *   GET    /chats/:id/messages     → MessageSummary[] (oldest first)
  *   PUT    /settings               { lang, quickReply, tone, selectedChats, llmModel }
  *   POST   /llm/key      {apiKey}  → the backend validates and stores the key
+ *   POST   /llm/replies  {chatId, messageId} → { summary, replies }
+ *   GET    /llm/models             → { models, current }
  *
  * The LLM key travels one way: into the backend. It is never written to
  * localStorage and never comes back through this client.
@@ -43,6 +47,11 @@ const TIMEOUT_MS = 10_000
  * touch React state.
  */
 export const UNAUTHORIZED_EVENT = 'teleglass:unauthorized'
+/**
+ * `/health` may have changed (a key was just saved in T3). The glasses page
+ * needs the new LLM status to choose between a request and "not configured".
+ */
+export const HEALTH_EVENT = 'teleglass:health'
 const ERROR_CODES: readonly AuthErrorCode[] = [
   'wrongCode',
   'expiredCode',
@@ -50,6 +59,7 @@ const ERROR_CODES: readonly AuthErrorCode[] = [
   'wrongPassword',
   'network',
   'linkExpired',
+  'llm',
   'unknown',
 ]
 
@@ -271,6 +281,7 @@ export function createRealApi(base: string): Api {
             at: r.at,
             text: typeof r.text === 'string' ? r.text : '',
             out: r.out === true,
+            ...(r.media === true ? { media: true } : {}),
           },
         ]
       })
@@ -283,5 +294,44 @@ export function createRealApi(base: string): Api {
     async setLlmKey(apiKey) {
       await request(base, '/llm/key', { method: 'POST', body: JSON.stringify({ apiKey }) })
     },
+
+    async replies(chatId, messageId) {
+      const body = await request<unknown>(base, '/llm/replies', {
+        method: 'POST',
+        body: JSON.stringify({ chatId, messageId }),
+      })
+      return asReply(body)
+    },
+
+    async llmModels(): Promise<LlmModels> {
+      const body = await request<unknown>(base, '/llm/models')
+      const raw = body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
+      const models = Array.isArray(raw.models)
+        ? raw.models.flatMap((item) => {
+            if (!item || typeof item !== 'object') return []
+            const model = item as Record<string, unknown>
+            if (typeof model.id !== 'string' || model.id.length === 0) return []
+            return [{ id: model.id, label: typeof model.label === 'string' ? model.label : model.id }]
+          })
+        : []
+      return { models, current: typeof raw.current === 'string' ? raw.current : '' }
+    },
   }
+}
+
+/**
+ * Exactly three non-empty options or an `llm` error. A blank array is a failure
+ * on the glasses, not "no suggestions": the screen must not dress it up.
+ */
+function asReply(body: unknown): LlmReply {
+  if (!body || typeof body !== 'object') throw new AuthError('llm')
+  const raw = body as Record<string, unknown>
+  if (typeof raw.summary !== 'string') throw new AuthError('llm')
+  if (!Array.isArray(raw.replies) || raw.replies.length !== 3) throw new AuthError('llm')
+  const replies: string[] = []
+  for (const item of raw.replies) {
+    if (typeof item !== 'string' || item.trim().length === 0) throw new AuthError('llm')
+    replies.push(item)
+  }
+  return { summary: raw.summary, replies }
 }
