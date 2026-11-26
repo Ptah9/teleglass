@@ -76,7 +76,11 @@ export function ChatsScreen({
     return chat.title.toLowerCase().includes(q) || chat.preview.toLowerCase().includes(q)
   })
 
-  const unread = chats.filter((chat) => unreadIds.has(chat.id))
+  // Real chats carry their own unread count; the demo/mock inbox is what the
+  // glasses page knows about, so it is the fallback for chats without one.
+  const isUnread = (chat: ChatSummary) =>
+    chat.unread !== undefined ? chat.unread > 0 : unreadIds.has(chat.id)
+  const unread = chats.filter(isUnread)
   const allUnreadSelected = unread.length > 0 && unread.every((chat) => selected.has(chat.id))
 
   function toggle(id: string) {
@@ -138,7 +142,7 @@ export function ChatsScreen({
               </div>
             </div>
 
-            {chats.length > 0 ? (
+            {chats.length > 0 && unread.length > 0 ? (
               <button
                 type="button"
                 className="select-all"

@@ -1,7 +1,7 @@
 import type { TFunc } from '../i18n'
 import { chatById, chatLabel, unreadMsgs, visibleChats } from '../state/reducer'
 import type { AppState, Screen } from '../state/types'
-import { clipLines, lineCount } from '../state/wrap'
+import { clipLines, cutChars, cutToChars, cutToPx, lineCount, textWidth } from '../state/wrap'
 import * as LINES from '../state/limits'
 import { stamp } from './stamp'
 import { BORDER, LIST_ROWS, LIST_ROW, LVL, SLOT } from './geometry'
@@ -50,6 +50,9 @@ export interface View {
 /** Shared with the logic so the footer hint and the gesture cannot disagree. */
 const BODY_LINES = LINES.BODY_LINES
 const SUMMARY_LINES = LINES.SUMMARY_LINES
+const FULLTEXT_MAX_CHARS = LINES.FULLTEXT_MAX_CHARS
+/** A list row is capped at 64 characters (design-system.md §2, display.md). */
+const LIST_ITEM_CHARS = 64
 
 /**
  * LISTENING indicator: the official block ramp (design-guidelines § Glyphs).
@@ -161,6 +164,28 @@ function chatsView(s: AppState, t: TFunc): View {
     return { shape: shapeOf(texts), texts }
   }
 
+  // A connected account has two honest states before the list exists; neither
+  // falls back to the demo chats.
+  if (s.feedStatus === 'loading') {
+    const texts = textsOf([
+      { id: 'title', slot: 'title', content: t('idle.title'), level: LVL.main },
+      dividerSpec('divider'),
+      { id: 'body', slot: 'body', content: t('chats.loading'), level: LVL.body, capture: true },
+      { id: 'footer', slot: 'footer', content: '', level: LVL.caption },
+    ])
+    return { shape: shapeOf(texts), texts }
+  }
+
+  if (s.feedStatus === 'error') {
+    const texts = textsOf([
+      { id: 'title', slot: 'title', content: t('idle.title'), level: LVL.main },
+      dividerSpec('divider'),
+      { id: 'body', slot: 'body', content: t('chats.error'), level: LVL.body, capture: true },
+      { id: 'footer', slot: 'footer', content: t('chats.retry'), level: LVL.caption },
+    ])
+    return { shape: shapeOf(texts), texts }
+  }
+
   const visible = visibleChats(s)
 
   // The CHATS footer changes with the quick reply state: normal, sent (2 s), not sent.
@@ -192,12 +217,19 @@ function chatsView(s: AppState, t: TFunc): View {
   // Telegram shows it; while sending — "· sending…".
   const items = visible.map((c) => {
     const last = c.messages[c.messages.length - 1]
-    const base = t('chats.row', {
-      chat: chatLabel(c).toUpperCase(),
-      time: last ? stamp(last.at, s.lang) : '—',
-      n: unreadMsgs(c, s.read).length,
-    })
-    return s.sendingRow === c.id ? `${base} · ${t('chats.sending')}` : base
+    const time = last ? stamp(last.at, s.lang) : '—'
+    const n = unreadMsgs(c, s.read).length
+    const suffix = s.sendingRow === c.id ? ` · ${t('chats.sending')}` : ''
+    // A native row is one 536 px line: the name gets whatever is left after the
+    // time, the counter and the sending suffix, cut by width. The 64-character
+    // cap is the platform's own item limit, so it bounds the whole item too.
+    const tail = t('chats.row', { chat: '', time, n }) + suffix
+    const room = Math.max(1, SLOT.body.w - textWidth(tail))
+    const name = cutChars(
+      chatLabel(c).toUpperCase(),
+      Math.max(4, LIST_ITEM_CHARS - [...tail].length),
+    )
+    return t('chats.row', { chat: cutToPx(name, room), time, n }) + suffix
   })
 
   const texts = textsOf([
@@ -230,7 +262,7 @@ function chatView(s: AppState, t: TFunc): View {
   if (!msg) return chatEmptyView(s, t, scr.chatId)
 
   // The counter is in the header, not the footer: the footer is taken by gestures (ux-flow § Жесты).
-  const header = `${chatLabel(chat).toUpperCase()} · ${t('page.counter', {
+  const header = `${cutChars(chatLabel(chat).toUpperCase(), 30)} · ${t('page.counter', {
     page: scr.msgIndex + 1,
     total: msgs.length,
   })}`
@@ -273,7 +305,7 @@ function chatView(s: AppState, t: TFunc): View {
 
 function chatEmptyView(s: AppState, t: TFunc, chatId: string): View {
   const chat = chatById(s, chatId)
-  const header = chat ? chatLabel(chat).toUpperCase() : t('idle.title')
+  const header = chat ? cutChars(chatLabel(chat).toUpperCase(), 30) : t('idle.title')
   const texts = textsOf([
     { id: 'title', slot: 'title', content: header, level: LVL.main },
     dividerSpec('divider'),
@@ -291,17 +323,29 @@ function fulltextView(s: AppState, t: TFunc): View {
   const msg = unreadMsgs(chat, s.read)[scr.msgIndex]
   if (!msg) return chatsView(s, t)
 
-  // The whole message goes to the body: it is event-capturing, so the firmware
-  // scrolls overflowing text and draws its own scrollbar (no custom rail/slider).
+  // One container takes at most 1000 characters on a rebuild (display.md
+  // § Content limits); Telegram messages are up to 4096. The rest stays on the
+  // phone, and the sub line says so instead of silently cutting the text.
+  const body = cutToChars(msg.text, FULLTEXT_MAX_CHARS)
+
   const texts = textsOf([
     {
       id: 'title',
       slot: 'title',
-      content: t('fulltext.title', { chat: chatLabel(chat).toUpperCase(), time: stamp(msg.at, s.lang) }),
+      content: t('fulltext.title', {
+        chat: cutChars(chatLabel(chat).toUpperCase(), 24),
+        time: stamp(msg.at, s.lang),
+      }),
       level: LVL.main,
     },
     dividerSpec('divider'),
-    { id: 'body', slot: 'body', content: msg.text, level: LVL.body, capture: true },
+    { id: 'body', slot: 'body', content: body.text, level: LVL.body, capture: true },
+    {
+      id: 'sub',
+      slot: 'sub',
+      content: body.cut ? t('fulltext.long') : '',
+      level: LVL.caption,
+    },
     { id: 'footer', slot: 'footer', content: t('fulltext.hint'), level: LVL.caption },
   ])
   return { shape: shapeOf(texts), texts }
@@ -356,7 +400,7 @@ function confirmView(s: AppState, t: TFunc): View {
   const scr = s.screen
   if (scr.kind !== 'confirm') return chatsView(s, t)
   const chat = chatById(s, scr.chatId)
-  const to = chat ? t('confirm.to', { chat: chatLabel(chat) }) : ''
+  const to = chat ? t('confirm.to', { chat: cutChars(chatLabel(chat), 40) }) : ''
   // The reply is quoted in full: long ones overflow and the firmware scrolls them.
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('confirm.title'), level: LVL.main },
@@ -373,7 +417,7 @@ function quickConfirmView(s: AppState, t: TFunc): View {
   if (scr.kind !== 'quickConfirm') return chatsView(s, t)
   const chat = chatById(s, scr.chatId)
   const n = chat ? unreadMsgs(chat, s.read).length : 0
-  const to = chat ? t('quickReply.to', { chat: chatLabel(chat), n }) : ''
+  const to = chat ? t('quickReply.to', { chat: cutChars(chatLabel(chat), 30), n }) : ''
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('quickReply.title'), level: LVL.main },
     dividerSpec('divider'),
@@ -391,7 +435,7 @@ function skipConfirmView(s: AppState, t: TFunc): View {
   const msgs = chat ? unreadMsgs(chat, s.read) : []
   const meta = chat
     ? t('skip.meta', {
-        chat: chatLabel(chat).toUpperCase(),
+        chat: cutChars(chatLabel(chat).toUpperCase(), 20),
         page: Math.min(scr.msgIndex + 1, msgs.length),
         total: msgs.length,
       })
@@ -430,7 +474,7 @@ function sentView(s: AppState, t: TFunc): View {
   const scr = s.screen
   if (scr.kind !== 'sent') return chatsView(s, t)
   const chat = chatById(s, scr.chatId)
-  const stamp = chat ? `${scr.at} · ${chat.person}` : scr.at
+  const stamp = chat ? `${scr.at} · ${cutChars(chat.person, 30)}` : scr.at
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('sent.title'), level: LVL.main },
     dividerSpec('divider'),

@@ -1,6 +1,7 @@
 import { createDemoApi } from './demo'
 import { createRealApi } from './client'
 import { hasDemoFlag } from './demo-flags'
+import { loadSettings } from '../store/settings'
 import type { Api } from './types'
 
 /**
@@ -49,6 +50,13 @@ async function probe(): Promise<Api> {
     window.clearTimeout(timer)
   }
 
+  // A saved Telegram link is not a demo: keep the real API so every screen says
+  // "backend is not answering" instead of showing someone else's mock chats as
+  // the user's own. The QA flag and a first run without a link stay demo.
+  if (!hasDemoFlag('connected') && loadSettings().telegram) {
+    console.warn('[teleglass] API: backend did not answer at', base, '— a link is saved, keeping the real API')
+    return remember(createRealApi(base))
+  }
   console.warn('[teleglass] API: backend did not answer at', base, '— demo mode')
   return remember(createDemoApi())
 }
@@ -72,6 +80,7 @@ export const api: Api = {
   logout: async () => (await ready()).logout(),
   deleteAll: async () => (await ready()).deleteAll(),
   chats: async () => (await ready()).chats(),
+  messages: async (chatId) => (await ready()).messages(chatId),
   putSettings: async (payload) => (await ready()).putSettings(payload),
   setLlmKey: async (apiKey) => (await ready()).setLlmKey(apiKey),
 }

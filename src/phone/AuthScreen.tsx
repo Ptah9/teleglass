@@ -174,7 +174,9 @@ export function AuthScreen({
   }
 
   async function submitCode() {
-    if (code.length !== 6) return
+    // Telegram login codes are usually five digits (the test DC uses the DC
+    // digit five times); the demo uses six. Accept the whole range.
+    if (code.length < 4 || code.length > 6) return
     setBusy(true)
     setError(null)
     try {
@@ -387,7 +389,11 @@ export function AuthScreen({
             />
             {isDemo ? <p className="detail dim">{t('phone.auth.code.demo')}</p> : null}
             {errorText ? <p className="error-text">{errorText}</p> : null}
-            <Button busy={busy} disabled={code.length !== 6} onClick={() => void submitCode()}>
+            <Button
+              busy={busy}
+              disabled={code.length < 4 || code.length > 6}
+              onClick={() => void submitCode()}
+            >
               {busy ? t('phone.auth.connecting') : t('phone.common.continue')}
             </Button>
             <div style={{ textAlign: 'center' }}>

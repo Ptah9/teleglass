@@ -71,6 +71,59 @@ export function layoutLines(text: string, maxPx: number = TEXT_PX): string[] {
   return out
 }
 
+/**
+ * Hard cut to a character budget, with an ellipsis inside the budget. Used for
+ * names in a 64-character list row and in one-line headers.
+ */
+export function cutChars(text: string, max: number): string {
+  const chars = [...text]
+  if (chars.length <= max) return text
+  return `${chars.slice(0, Math.max(1, max - 1)).join('')}…`
+}
+
+/**
+ * Cut one line to a pixel budget with the firmware's own metrics. A native list
+ * row is a single 536 px line: 64 characters may still be too wide at that
+ * size, so names are cut by width, not by count.
+ */
+export function cutToPx(text: string, maxPx: number): string {
+  if (getTextWidth(text) <= maxPx) return text
+  const chars = [...text]
+  let lo = 0
+  let hi = chars.length
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (getTextWidth(`${chars.slice(0, mid).join('')}…`) <= maxPx) lo = mid
+    else hi = mid - 1
+  }
+  return `${chars.slice(0, lo).join('')}…`
+}
+
+/** Width of one line, measured by the same metrics the firmware uses. */
+export function textWidth(text: string): number {
+  return getTextWidth(text)
+}
+
+/**
+ * Cut a message body to the container's character limit at the last word
+ * boundary (`docs/md/02-build/03-display.md` § Content limits: 1000 for
+ * `rebuildPageContainer`, which is how FULL TEXT replaces CHAT). The ellipsis
+ * is part of the budget.
+ */
+export function cutToChars(text: string, max: number): { text: string; cut: boolean } {
+  const chars = [...text]
+  if (chars.length <= max) return { text, cut: false }
+
+  let end = Math.max(1, max - 1)
+  for (let i = end; i > Math.max(0, end - 100); i--) {
+    if (/\s/.test(chars[i] ?? '')) {
+      end = i
+      break
+    }
+  }
+  return { text: `${chars.slice(0, end).join('').trimEnd()}…`, cut: true }
+}
+
 /** How many lines the text takes at this width — the official measurement. */
 export function lineCount(text: string, maxPx: number = TEXT_PX): number {
   return measureTextWrap(text, maxPx).lineCount

@@ -8,3 +8,4 @@ dist/
 # Workshop notes, not part of the submission
 BUGS.md
 HANDOFF.md
+backend/data/

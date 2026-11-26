@@ -5,6 +5,7 @@ import {
   type AuthState,
   type ChatSummary,
   type Health,
+  type MessageSummary,
 } from './types'
 
 /**
@@ -22,6 +23,7 @@ import {
  *   POST   /auth/logout
  *   DELETE /data
  *   GET    /chats                  → ChatSummary[]
+ *   GET    /chats/:id/messages     → MessageSummary[] (oldest first)
  *   PUT    /settings               { lang, quickReply, tone, selectedChats, llmModel }
  *   POST   /llm/key      {apiKey}  → the backend validates and stores the key
  *
@@ -35,6 +37,12 @@ import {
 
 const TOKEN_KEY = 'teleglass.token'
 const TIMEOUT_MS = 10_000
+/**
+ * A request came back 401: the token is dead or the Telegram session is gone.
+ * The app listens for this and drops the "connected" flag; the client cannot
+ * touch React state.
+ */
+export const UNAUTHORIZED_EVENT = 'teleglass:unauthorized'
 const ERROR_CODES: readonly AuthErrorCode[] = [
   'wrongCode',
   'expiredCode',
@@ -93,7 +101,10 @@ async function request<T>(base: string, path: string, init: RequestInit = {}): P
     window.clearTimeout(timer)
   }
 
-  if (response.status === 401) clearToken()
+  if (response.status === 401) {
+    clearToken()
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+  }
 
   let body: unknown = null
   try {
@@ -169,12 +180,10 @@ export function createRealApi(base: string): Api {
     },
 
     async auth(): Promise<AuthState> {
-      try {
-        return asAuthState(await request(base, '/auth'))
-      } catch (err) {
-        if (err instanceof AuthError && err.code === 'network') throw err
-        return { step: 'idle' }
-      }
+      // No swallow-on-error: `{step:'idle'}` is a definite answer only when the
+      // backend really said so. A network error, a 500 or a wrong route is
+      // reported as a failure, and the caller keeps the saved link.
+      return asAuthState(await request(base, '/auth'))
     },
 
     async sendCode(phone) {
@@ -209,6 +218,10 @@ export function createRealApi(base: string): Api {
 
     async linkState() {
       const body = await request<Record<string, unknown>>(base, '/auth/link')
+      // Confirming the link happens outside our WebView, so the backend hands
+      // the bearer token back on the poll that sees the confirmation. It is a
+      // token for our backend only, never a Telegram session.
+      setToken(body.token)
       if (body.status === 'connected') return 'connected'
       if (body.status === 'expired') return 'expired'
       return 'pending'
@@ -236,6 +249,28 @@ export function createRealApi(base: string): Api {
             id: r.id,
             title: r.title,
             preview: typeof r.preview === 'string' ? r.preview : '',
+            ...(typeof r.unread === 'number' ? { unread: Math.max(0, r.unread) } : {}),
+          },
+        ]
+      })
+    },
+
+    async messages(chatId: string): Promise<MessageSummary[]> {
+      const rows = await request<unknown>(
+        base,
+        `/chats/${encodeURIComponent(chatId)}/messages`,
+      )
+      if (!Array.isArray(rows)) return []
+      return rows.flatMap((row) => {
+        if (!row || typeof row !== 'object') return []
+        const r = row as Record<string, unknown>
+        if (typeof r.id !== 'string' || typeof r.at !== 'string') return []
+        return [
+          {
+            id: r.id,
+            at: r.at,
+            text: typeof r.text === 'string' ? r.text : '',
+            out: r.out === true,
           },
         ]
       })

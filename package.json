@@ -1,7 +1,7 @@
 {
   "name": "teleglass",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,7 +18,8 @@
     "i18next": "^27.2.9",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "react-i18next": "^18.0.3"
+    "react-i18next": "^18.0.3",
+    "teleproto": "^1.234.0"
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.1.12",

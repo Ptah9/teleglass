@@ -7,6 +7,7 @@ import {
   type AuthState,
   type ChatSummary,
   type Health,
+  type MessageSummary,
 } from './types'
 
 /**
@@ -185,6 +186,18 @@ export function createDemoApi(): Api {
         id: chat.id,
         title: chatLabel(chat),
         preview: chat.messages[chat.messages.length - 1]?.text ?? '',
+      }))
+    },
+
+    async messages(chatId: string): Promise<MessageSummary[]> {
+      await sleep(120)
+      const chat = MOCK_CHATS.find((item) => item.id === chatId)
+      if (!chat) return []
+      return chat.messages.map((message) => ({
+        id: message.id,
+        at: message.at,
+        text: message.text,
+        out: false,
       }))
     },
 

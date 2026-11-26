@@ -1,0 +1,15 @@
+{
+  "name": "teleglass-backend",
+  "private": true,
+  "version": "0.4.0",
+  "description": "Teleglass backend: MTProto through teleproto, HTTP API for the phone WebView, SQLite storage",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node --disable-warning=ExperimentalWarning dist/index.js",
+    "dev": "npm run build && npm start",
+    "test": "npm run build && node --test \"test/*.test.js\""
+  }
+}

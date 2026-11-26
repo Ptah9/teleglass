@@ -51,6 +51,19 @@ export interface ChatSummary {
   title: string
   /** Last message, one line, as it arrives from Telegram (data, not a string). */
   preview: string
+  /** Unread messages, when the backend knows them (real Telegram, not the demo). */
+  unread?: number
+}
+
+/** One message of a dialog, ready for the glasses page. */
+export interface MessageSummary {
+  id: string
+  /** ISO datetime; the page formats it per language (`view/stamp.ts`). */
+  at: string
+  /** The text itself (author line breaks kept) or a media word (`Photo`). */
+  text: string
+  /** Sent by this account; the glasses only present incoming messages. */
+  out: boolean
 }
 
 export interface Api {
@@ -71,6 +84,12 @@ export interface Api {
   deleteAll(): Promise<void>
   /** Chats offered for selection in T1. */
   chats(): Promise<ChatSummary[]>
+  /**
+   * The newest messages of the dialog's unread window, oldest first. The glasses
+   * show the last `unread` incoming ones, so the WebView trims here instead of
+   * asking the backend for a per-device count.
+   */
+  messages(chatId: string): Promise<MessageSummary[]>
   /** Mirrors the phone settings to the backend so the glasses can read them. */
   putSettings(payload: {
     lang: string

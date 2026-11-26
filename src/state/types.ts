@@ -42,6 +42,12 @@ export type AppEvent =
    * Audio capture stops while the WebView is suspended, so it is re-armed here.
    */
   | { type: 'foreground' }
+  /**
+   * Real chats from the backend (the WebView fetched them, the page cannot).
+   * `demo` is the mock set; `loading`/`error` clear the list instead of faking it.
+   * `merge` keeps chats that this (incomplete) snapshot did not carry.
+   */
+  | { type: 'feed'; status: FeedStatus; chats: MockChat[] | null; merge?: boolean }
   | { type: 'tick'; now: number }
 
 /** Message from Telegram. A mock in v0.1; the summary field appears when the text is long. */
@@ -63,6 +69,13 @@ export interface MockChat {
 }
 
 export type AudioSource = 'glasses' | 'phone'
+
+/**
+ * Where the chat list came from. `demo` is the labelled demo set, `loading` and
+ * `error` are the honest "not in Telegram yet" states — a connected account must
+ * never show mock chats while the real list is missing.
+ */
+export type FeedStatus = 'demo' | 'loading' | 'ready' | 'error'
 
 /** HEARD states: recognized text, "did not catch it", "phone microphone". */
 export type HeardVariant = 'ok' | 'error' | 'phoneMic'
@@ -127,6 +140,8 @@ export interface AppState {
   lang: Lang
   screen: Screen
   chats: MockChat[]
+  /** Where `chats` came from; the CHATS screen keys its loading/error text off it. */
+  feedStatus: FeedStatus
   /** ids of read messages. Unread = everything else. */
   read: Record<string, true>
   /**

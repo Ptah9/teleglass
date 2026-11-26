@@ -5,22 +5,30 @@ pick with a gesture → confirm → send. One WebView serves both surfaces: the
 phone (login and settings) and the glasses (a render target driven by Even Hub
 containers).
 
-**v0.3 — the phone WebView.** Telegram and the LLM are still mocks (`src/api/demo.ts`,
-`src/state/data.ts`), and the screens say so: a `Demo` badge on the settings screen,
-a printed demo code on the login screen, `Backend: Demo` in the status card.
+**v0.4.0 — real Telegram in the glasses feed.** The phone signs in to Telegram
+through the backend (MTProto, no Bot API stand-in), and the glasses list is the
+account's unread dialogs with their real messages. Still mock: sending from the
+glasses and read marks (v0.6), the LLM's reply options (v0.5), and the demo set
+used before a link exists (`src/api/demo.ts`).
 
 What is real in this version:
 
-- the full glasses UI from v0.1 (20 screens, gestures, native scrolling, microphone
-  level) and its measured 27/40 px geometry;
-- the phone surface: Telegram sign-in (number + code + 2FA, link as the reserved
-  path), chat selection, quick reply, tone, language, connection status, disconnect
-  and delete-all with confirmations;
+- the glasses list is live: unread dialogs from Telegram with their real texts
+  and times, `1/N` pages through the unread messages of a chat, and the list
+  refreshes on start and when the WebView comes back to the foreground;
+- phone sign-in (number + code + 2FA), disconnect and delete-all run against
+  the backend; the session and the keys stay there, the WebView holds only a
+  bearer token;
+- the backend speaks MTProto through `teleproto`: `GET /chats`,
+  `GET /chats/:id/messages`, sessions in SQLite under `backend/data/`;
+- the full glasses UI from v0.1 (20 screens, gestures, native scrolling,
+  microphone level) and its measured 27/40 px geometry;
 - one state for both surfaces: `Save` in `Chats` filters the glasses list, the
-  quick reply and the language reach the glasses immediately, a disconnect sends
-  the glasses back to `Connect Telegram on your phone.`;
-- persistence in `localStorage` (survives the Android WebView being killed) and
-  the API facade that switches to the real backend as soon as it answers.
+  quick reply and the language reach the glasses immediately, a disconnect
+  sends the glasses back to `Connect Telegram on your phone.`;
+- persistence in `localStorage` (survives the Android WebView being killed);
+  the API facade switches to the real backend as soon as it answers, and a
+  saved link keeps the real API even when the backend is down.
 
 ## Run
 
@@ -121,7 +129,8 @@ implementation is `src/api/client.ts`.
 | `GET` | `/api/auth/link` | `pending` / `connected` / `expired` |
 | `POST` | `/api/auth/logout` | drop the Telegram session |
 | `DELETE` | `/api/data` | remove the session and stored data |
-| `GET` | `/api/chats` | `[{ id, title, preview }]` for T1 |
+| `GET` | `/api/chats` | `[{ id, title, preview, unread }]` for T1 and the glasses feed |
+| `GET` | `/api/chats/:id/messages` | last messages of one dialog, oldest first: `[{ id, at, text, out }]` |
 | `PUT` | `/api/settings` | mirror `{ lang, quickReply, tone, selectedChats, llmModel }` for the LLM |
 | `POST` | `/api/llm/key` | `{ apiKey }` — the backend stores the key; the WebView never keeps it |
 
@@ -180,5 +189,5 @@ will run on our backend with Whisper.
   the sign-in form, WebView suspension during link login;
 - remove the demo levers and the `demo.*` keys before submission.
 
-The spec and the screen map live in the team repository's `hack/` folder
+The spec and the screen map live in the team repository's `specs/` folder
 (`ux-flow.md` for the glasses, `ux-webview.md` for the phone).

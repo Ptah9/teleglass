@@ -5,7 +5,16 @@ import {
   MOCK_INBOX,
   MOCK_QUICK_REPLY,
 } from './data'
-import type { AppEvent, AppState, AudioSource, Gesture, MockChat, MockMessage } from './types'
+import type {
+  AppEvent,
+  AppState,
+  AudioSource,
+  FeedStatus,
+  Gesture,
+  MockChat,
+  MockMessage,
+  Screen,
+} from './types'
 import { lineCount } from './wrap'
 import * as LINES from './limits'
 /**
@@ -23,6 +32,8 @@ import * as LINES from './limits'
 
 /** How many body lines fit on CHAT (shared with the view). */
 const BODY_LINES = LINES.BODY_LINES
+/** Native list page limit (shared with the view). */
+const CHATS_MAX = LINES.CHATS_MAX
 /** Indicator columns kept in state (shared with the view). */
 const WAVE_LEN = LINES.WAVE_LEN
 /** Mock "sending to Telegram" delay. */
@@ -40,6 +51,7 @@ export function initialState(): AppState {
     lang: 'en',
     screen: { kind: 'chats' },
     chats: MOCK_CHATS,
+    feedStatus: 'demo',
     read: {},
     selChat: 0,
     quickReplyText: MOCK_QUICK_REPLY,
@@ -48,7 +60,8 @@ export function initialState(): AppState {
     phoneMic: false,
     telegramConnected: true,
     phoneRead: null,
-    lastChecked: '19:42',
+    // "now" is honest for the demo empty screen; a real feed replaces it on load.
+    lastChecked: timeStr(),
     flash: null,
     sendingRow: null,
     inboxQueue: MOCK_INBOX.map((x) => ({ chatId: x.chatId, message: { ...x.message } })),
@@ -70,9 +83,10 @@ export function unreadMsgs(chat: MockChat, read: Record<string, true>): MockMess
 
 export function visibleChats(s: AppState): MockChat[] {
   const offered = s.chats.filter((c) => unreadMsgs(c, s.read).length > 0)
-  if (s.selectedChats === null) return offered
-  const allowed = new Set(s.selectedChats)
-  return offered.filter((c) => allowed.has(c.id))
+  const selected = s.selectedChats === null ? null : new Set(s.selectedChats)
+  const allowed = selected === null ? offered : offered.filter((c) => selected.has(c.id))
+  // The native list holds 20 items; the phone still has the rest unread.
+  return allowed.slice(0, CHATS_MAX)
 }
 
 /** 'Ivan · Project' / 'Mom' — as in the screen body (to Ivan · Project). */
@@ -85,12 +99,28 @@ export function timeStr(d: Date = new Date()): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/**
+ * The read map lives as long as the page. A few thousand message ids is a day
+ * of heavy use; older entries are dropped so the map cannot grow without bound.
+ * Until `markRead` exists (v0.6) Telegram still counts those messages unread, so
+ * a dropped id can come back; the cap is about memory, not about forgetting.
+ */
+const READ_CAP = 2_000
+
+function capRead(read: Record<string, true>): Record<string, true> {
+  const keys = Object.keys(read)
+  if (keys.length <= READ_CAP) return read
+  const capped: Record<string, true> = {}
+  for (const key of keys.slice(keys.length - READ_CAP)) capped[key] = true
+  return capped
+}
+
 function markAllRead(s: AppState, chatId: string): Record<string, true> {
   const chat = chatById(s, chatId)
   if (!chat) return s.read
   const read = { ...s.read }
   for (const m of chat.messages) read[m.id] = true
-  return read
+  return capRead(read)
 }
 
 /** Telegram marks the answered message read — the rest of the chat stays unread. */
@@ -99,7 +129,7 @@ function markMessageRead(s: AppState, chatId: string, msgIndex: number): Record<
   if (!chat) return s.read
   const msg = unreadMsgs(chat, s.read)[msgIndex]
   if (!msg) return s.read
-  return { ...s.read, [msg.id]: true }
+  return capRead({ ...s.read, [msg.id]: true })
 }
 
 function isLongMessage(msg: MockMessage): boolean {
@@ -130,6 +160,8 @@ export function reduce(s: AppState, e: AppEvent): AppState {
       // Re-arming the microphone is a page duty (it owns the SDK calls); the
       // logic has nothing to change, the screen stays as it was.
       return s
+    case 'feed':
+      return onFeed(s, e.status, e.chats, e.merge === true)
     case 'tick':
       return onTick(s, e.now)
   }
@@ -176,6 +208,98 @@ function onGesture(s: AppState, g: Gesture): AppState {
 
 function chatsScreen(s: AppState): AppState {
   return { ...s, screen: { kind: 'chats' } }
+}
+
+/**
+ * The backend feed replaces the chat list wholesale. A background refresh must
+ * not move the message under the user's eyes, so the open screen and the CHATS
+ * selection are carried over by id, not by index. `loading`/`error` clear the
+ * list: a connected account never falls back to the demo set.
+ */
+function onFeed(s: AppState, status: FeedStatus, chats: MockChat[] | null, merge: boolean): AppState {
+  const incoming = status === 'ready' ? (chats ?? []) : []
+  const next =
+    status === 'demo'
+      ? MOCK_CHATS
+      : status === 'ready'
+        ? merge && s.feedStatus === 'ready'
+          ? withKeptChats(s.chats, incoming)
+          : incoming
+        : []
+  if (status === s.feedStatus && next === s.chats) return s
+
+  const ids = new Set(next.map((chat) => chat.id))
+  const screen =
+    status === 'ready'
+      ? (remapScreen(s, next) ?? { kind: 'chats' as const })
+      : s.screen.kind === 'chats'
+        ? s.screen
+        : ({ kind: 'chats' } as const)
+
+  // A disconnect drops the read map: the demo (and the next account) must not
+  // inherit "already handled" from someone else's messages. A refresh inside
+  // the demo keeps it — tapping "check again" must not resurrect read chats.
+  const read = status === 'demo' && s.feedStatus !== 'demo' ? {} : s.read
+  const candidate: AppState = { ...s, chats: next, read, screen, feedStatus: status }
+
+  // The highlight is an index into the visible list; after a refresh the list
+  // may be reordered, so find the same chat again instead of keeping the row.
+  const previous = visibleChats(s)[s.selChat]
+  const visible = visibleChats(candidate)
+  const found = previous ? visible.findIndex((chat) => chat.id === previous.id) : -1
+  const selChat =
+    found >= 0 ? found : visible.length === 0 ? 0 : Math.min(s.selChat, visible.length - 1)
+
+  return {
+    ...candidate,
+    selChat,
+    lastChecked: status === 'ready' || status === 'demo' ? timeStr() : s.lastChecked,
+    flash: s.flash && ids.has(s.flash.chatId) ? s.flash : null,
+    sendingRow: s.sendingRow && ids.has(s.sendingRow) ? s.sendingRow : null,
+    phoneRead: s.phoneRead && ids.has(s.phoneRead) ? s.phoneRead : null,
+  }
+}
+
+/**
+ * A chat that this snapshot did not carry stays on screen with its last known
+ * messages. It was real a moment ago; dropping it would make one failed request
+ * look like "the chat is gone", and the next full snapshot settles it.
+ */
+function withKeptChats(old: MockChat[], fresh: MockChat[]): MockChat[] {
+  const seen = new Set(fresh.map((chat) => chat.id))
+  const kept = old.filter((chat) => !seen.has(chat.id))
+  return kept.length === 0 ? fresh : [...fresh, ...kept]
+}
+
+/**
+ * The same message under a refreshed list. Screens that quote or mark a message
+ * keep their `msgIndex`, which would point at a neighbour after a refresh; the
+ * index is moved to the message with the same id. `null` — the message is gone,
+ * the caller falls back to CHATS.
+ */
+function remapScreen(s: AppState, next: MockChat[]): Screen | null {
+  const screen = s.screen
+  if (screen.kind === 'chats') return screen
+  const chat = next.find((item) => item.id === screen.chatId)
+  if (!chat) return null
+
+  // These screens do not point at one message, or point at the chat only:
+  // keeping them is safe as long as the chat still exists.
+  if (screen.kind === 'sent' || screen.kind === 'quickConfirm' || screen.kind === 'chatEmpty') {
+    return screen
+  }
+
+  // Everything else remembers one message by its position in the unread list.
+  // A refresh can add a newer unread (the list grows at the front) or drop one
+  // read on the phone (it shrinks), so the index is moved to the same id.
+  const msgIndex = 'msgIndex' in screen ? screen.msgIndex : undefined
+  if (msgIndex === undefined) return screen
+  const oldChat = chatById(s, screen.chatId)
+  const oldMsg = oldChat ? unreadMsgs(oldChat, s.read)[msgIndex] : undefined
+  if (!oldMsg) return screen
+  const index = unreadMsgs(chat, s.read).findIndex((message) => message.id === oldMsg.id)
+  if (index < 0) return null
+  return { ...screen, msgIndex: index }
 }
 
 function onChats(s: AppState, g: Gesture): AppState {
@@ -247,6 +371,8 @@ function clampSel(s: AppState, length: number): number {
 
 function checkAgain(s: AppState): AppState {
   const now = timeStr()
+  // The mock inbox belongs to the demo; a real list is refreshed by the page.
+  if (s.feedStatus !== 'demo') return { ...s, lastChecked: now }
   const [head, ...rest] = s.inboxQueue
   if (!head) return { ...s, lastChecked: now }
   const chats = s.chats.map((c) =>

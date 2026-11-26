@@ -2,7 +2,15 @@ import { makeT } from '../i18n'
 import { buildView, type View } from '../view/build'
 import { createTarget, type GlassesTarget, type MenuItem } from './adapter'
 import { initialState, reduce, visibleChats } from '../state/reducer'
-import type { AppEvent, AppState, AudioSource, Gesture, Lang } from '../state/types'
+import type {
+  AppEvent,
+  AppState,
+  AudioSource,
+  FeedStatus,
+  Gesture,
+  Lang,
+  MockChat,
+} from '../state/types'
 import * as LINES from '../state/limits'
 
 /**
@@ -47,6 +55,14 @@ export interface Page {
   gesture(g: Gesture): void
   /** Phone settings (T1/T3) pushed into the screen state. */
   applySettings(settings: GlassesSettings): void
+  /** Real chats from the backend; `status` says whether they are real at all. */
+  applyChats(status: FeedStatus, chats: MockChat[] | null, merge?: boolean): void
+  /**
+   * The screen asked for fresh data (tap on an empty CHATS, or the WebView came
+   * back to the foreground). The page has no network — the WebView fetches and
+   * calls `applyChats` with the result. `null` removes the handler.
+   */
+  onRefresh(cb: (() => void) | null): void
   subscribe(cb: (s: AppState) => void): () => void
   state(): AppState
   /** true — the page lives inside Even App (glasses), false — browser. */
@@ -59,6 +75,8 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
 
   let pending: { timer: number; run: () => void } | null = null
   let lastSwipe = 0
+  /** Set by the WebView: it owns `fetch`, the page only says "data is stale". */
+  let refreshHandler: (() => void) | null = null
 
   function menuItems(): MenuItem[] {
     const t = makeT(s.lang)
@@ -276,7 +294,14 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   const gesture = (g: Gesture): void => {
     if (g === 'click') {
       // A double tap may follow — wait out CLICK_DELAY.
-      scheduleClick(() => apply({ type: 'gesture', gesture: 'click' }))
+      scheduleClick(() => {
+        // ux-flow: a tap on an empty CHATS means "check again". With real chats
+        // that is a backend round-trip, so the page asks the WebView for it.
+        const idle =
+          s.telegramConnected && s.screen.kind === 'chats' && visibleChats(s).length === 0
+        apply({ type: 'gesture', gesture: 'click' })
+        if (idle) refreshHandler?.()
+      })
       return
     }
     if (g === 'doubleClick') {
@@ -315,6 +340,8 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
         // Audio capture stops while the WebView is suspended
         // (background-lifecycle.md): ask for the same source again.
         if (s.screen.kind === 'listening') void openMic(s.screen.source)
+        // The glasses were off the head: unread may have arrived meanwhile.
+        if (s.telegramConnected) refreshHandler?.()
         return
       default:
         apply(e)
@@ -332,6 +359,19 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     publish(mergeSettings(s, v))
   }
 
+  /**
+   * A feed is a full snapshot of what the glasses may show; the reducer decides
+   * how the current screen survives it. `demo` restores the mock set, `loading`
+   * and `error` clear the list — a connected account is never shown mocks.
+   */
+  function applyChats(status: FeedStatus, chats: MockChat[] | null, merge = false): void {
+    publish(reduce(s, { type: 'feed', status, chats, merge }))
+  }
+
+  function onRefresh(cb: (() => void) | null): void {
+    refreshHandler = cb
+  }
+
   // First screen and ticks. StrictMode mounts components twice —
   // createPage is called once per page (see App.tsx).
   requestRender()
@@ -341,6 +381,8 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     dispatch,
     gesture,
     applySettings,
+    applyChats,
+    onRefresh,
     subscribe(cb) {
       listeners.add(cb)
       return () => {
@@ -373,7 +415,11 @@ function mergeSettings(s: AppState, v: GlassesSettings): AppState {
 
   if (next.telegramConnected !== v.telegramConnected) {
     next = v.telegramConnected
-      ? { ...next, telegramConnected: true }
+      ? next.feedStatus === 'demo'
+        ? // A fresh link: the demo chats are not this account's. Open on
+          // "checking" and wait for the real feed instead of showing them.
+          { ...next, telegramConnected: true, feedStatus: 'loading', chats: [], read: {} }
+        : { ...next, telegramConnected: true }
       : {
           ...next,
           telegramConnected: false,
@@ -401,7 +447,14 @@ export function getPage(start?: GlassesSettings): Promise<Page> {
     // the phone settings, when passed, win because they are the user's choice.
     const saved = await target.loadLang()
     let base = saved ? { ...initialState(), lang: saved } : initialState()
-    if (start) base = mergeSettings(base, start)
+    if (start) {
+      base = mergeSettings(base, start)
+      // A saved "connected" flag opens on "checking", never on the demo chats:
+      // the first frame must not show someone else's conversations as real.
+      if (start.telegramConnected && base.feedStatus === 'demo') {
+        base = { ...base, feedStatus: 'loading', chats: [], read: {} }
+      }
+    }
     const page = createPage(target, base)
     console.log('[teleglass] target:', target.native ? 'glasses bridge' : 'browser mock')
     return page
