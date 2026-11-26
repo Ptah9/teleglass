@@ -43,6 +43,11 @@ export const CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const CONTEXT_FETCH = 30
 const SUMMARY_CHARS = 90
 const REPLY_CHARS = 120
+/** `/llm/replies` budget: one minute and at most this many admissions. */
+const WINDOW_MS = 60_000
+const LIMIT_PER_WINDOW = 20
+/** Above this many session keys, fully expired windows are dropped. */
+const PRUNE_AT = 256
 /** Text width of the CHAT body; "long" is the same 5-line rule as on the glasses. */
 const TEXT_PX = 536
 const BODY_LINES = 5
@@ -81,6 +86,10 @@ export class LlmService implements LlmApi {
   private readonly injected: LlmClient | null
   /** Last provider verdict; `null` = no refusal since the process started. */
   private lastFailure: string | null = null
+  /** Requests in flight, keyed by session and chat (`admit`). */
+  private readonly inFlight = new Set<string>()
+  /** Start times of admitted requests, per session, for the one-minute window. */
+  private readonly recent = new Map<string, number[]>()
 
   constructor(deps: LlmServiceDeps) {
     this.config = deps.config
@@ -108,10 +117,52 @@ export class LlmService implements LlmApi {
 
   async replies(token: string | null, chatId: string, messageId: string): Promise<LlmReply> {
     const started = Date.now()
-    const deadline = started + LLM_BUDGET_MS
-
     const sessionId = this.sessionIdOf(token)
     if (!sessionId) throw new ContractError('unknown', 401)
+
+    // The glasses' retry button must not turn into a money loop: one request in
+    // flight per chat and at most twenty a minute per session.
+    const release = this.admit(sessionId, chatId, started)
+    try {
+      return await this.generate(token, sessionId, chatId, messageId, started)
+    } finally {
+      release()
+    }
+  }
+
+  /** Reserves a slot or throws `429 llm` when the caller is over the limit. */
+  private admit(sessionId: string, chatId: string, now: number): () => void {
+    const key = `${sessionId}\u0000${chatId}`
+    if (this.inFlight.has(key)) throw new ContractError('llm', 429)
+
+    // A key per session would live forever; once the map is worth cleaning,
+    // drop the sessions whose whole window has expired.
+    if (this.recent.size >= PRUNE_AT) {
+      for (const [id, times] of this.recent) {
+        if (times.every((at) => now - at >= WINDOW_MS)) this.recent.delete(id)
+      }
+    }
+
+    const recent = (this.recent.get(sessionId) ?? []).filter((at) => now - at < WINDOW_MS)
+    if (recent.length >= LIMIT_PER_WINDOW) {
+      this.recent.set(sessionId, recent)
+      this.log.warn('llm.rateLimited', { requests: recent.length })
+      throw new ContractError('llm', 429)
+    }
+    recent.push(now)
+    this.recent.set(sessionId, recent)
+    this.inFlight.add(key)
+    return () => this.inFlight.delete(key)
+  }
+
+  private async generate(
+    token: string | null,
+    sessionId: string,
+    chatId: string,
+    messageId: string,
+    started: number,
+  ): Promise<LlmReply> {
+    const deadline = started + LLM_BUDGET_MS
 
     // No key — no request at all, not even to Telegram.
     const apiKey = this.resolveKey()

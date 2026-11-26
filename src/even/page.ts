@@ -1,7 +1,7 @@
 import { makeT } from '../i18n'
 import { buildView, type View } from '../view/build'
 import { createTarget, type GlassesTarget, type MenuItem } from './adapter'
-import { chatById, initialState, reduce, unreadMsgs, visibleChats } from '../state/reducer'
+import { anchorId, chatById, initialState, reduce, unreadMsgs, visibleChats } from '../state/reducer'
 import type {
   AppEvent,
   AppState,
@@ -73,10 +73,45 @@ export interface Page {
     messageId: string,
     result: { summary: string; replies: string[] } | null,
   ): void
+  /**
+   * SENDING opened and a real message is behind it: the WebView sends the text
+   * and answers through `applySend`. The page holds no token and no network.
+   */
+  onSend(
+    cb: ((chatId: string, messageId: string, text: string, mode: 'reply' | 'quick') => void) | null,
+  ): void
+  /**
+   * The send is over: `true` — SENT (with Telegram's time), `false` — OFFLINE;
+   * `gone` — the message is not there any more, so SENDING is left without a
+   * retry. `chatId`/`messageId` name the attempt the answer belongs to.
+   */
+  applySend(result: {
+    chatId: string
+    messageId: string
+    ok: boolean
+    at?: string
+    gone?: boolean
+  }): void
+  /** A read mark did not reach Telegram: stop hiding that chat's messages. */
+  applyUnread(chatId: string, messageId?: string): void
+  /**
+   * A message was skipped on the glasses and is read now; Telegram must be
+   * told. Viewing a chat never calls this — просмотр ≠ прочтение.
+   */
+  onMark(cb: ((chatId: string, messageId: string) => void) | null): void
   subscribe(cb: (s: AppState) => void): () => void
   state(): AppState
   /** true — the page lives inside Even App (glasses), false — browser. */
   readonly native: boolean
+}
+
+/** Telegram id (or the demo id) of one message of a chat's unread window. */
+function messageIdIn(s: AppState, chatId: string, msgIndex: number): string | null {
+  const chat = chatById(s, chatId)
+  if (!chat) return null
+  const message = unreadMsgs(chat, s.read)[msgIndex]
+  // One rule for "which id does this row mean", shared with the reducer.
+  return message ? anchorId(message) : null
 }
 
 export function createPage(target: GlassesTarget, start: AppState = initialState()): Page {
@@ -89,8 +124,16 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   let refreshHandler: (() => void) | null = null
   /** Set by the WebView: it fetches LLM options, the page shows the skeleton. */
   let replyHandler: ((chatId: string, messageId: string) => void) | null = null
+  /** Set by the WebView: it owns `sendReply`, the page shows SENDING. */
+  let sendHandler:
+    | ((chatId: string, messageId: string, text: string, mode: 'reply' | 'quick') => void)
+    | null = null
+  /** Set by the WebView: SKIP? marks the message read on Telegram. */
+  let readHandler: ((chatId: string, messageId: string) => void) | null = null
   /** Requests already sent, so a tick does not ask twice for one message. */
   const repliesInFlight = new Set<string>()
+  /** Sends in flight, keyed by `chatId#messageId`: the clock must not resolve them. */
+  const sendsInFlight = new Set<string>()
 
   function menuItems(): MenuItem[] {
     const t = makeT(s.lang)
@@ -262,6 +305,7 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     requestRender()
     for (const l of [...listeners]) l(s)
     maybeRequestReplies()
+    maybeRequestSend()
   }
 
   /**
@@ -284,6 +328,53 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     if (repliesInFlight.has(key)) return
     repliesInFlight.add(key)
     replyHandler(scr.chatId, msg.remoteId)
+  }
+
+  /**
+   * SENDING is resolved by the WebView's answer, not by the clock: the request
+   * leaves the moment the state says `sending`, and `applySend` is the way back.
+   * The clock only fails the demo lever "backend not responding".
+   */
+  function maybeRequestSend(): void {
+    const scr = s.screen
+    if (scr.kind !== 'sending') return
+    // The lever: no request leaves, and the clock turns SENDING into OFFLINE.
+    if (s.backendDown) return
+    const fail = (why: string): void => {
+      console.warn(`[teleglass] send was not attempted: ${why}`)
+      publish(
+        reduce(s, {
+          type: 'sendResult',
+          chatId: scr.chatId,
+          messageId: scr.messageId,
+          ok: false,
+        }),
+      )
+    }
+    if (sendHandler === null) {
+      // No way to send: never let the clock pretend it went through.
+      fail('no handler')
+      return
+    }
+    if (!scr.messageId) {
+      // The message left the feed before the tap was committed; there is
+      // nothing to anchor `random_id` to, and a retry would hit the same wall.
+      console.warn('[teleglass] send was not attempted: no anchor')
+      publish(
+        reduce(s, {
+          type: 'sendResult',
+          chatId: scr.chatId,
+          messageId: scr.messageId,
+          ok: false,
+          gone: true,
+        }),
+      )
+      return
+    }
+    const key = `${scr.chatId}#${scr.messageId}`
+    if (sendsInFlight.has(key)) return
+    sendsInFlight.add(key)
+    sendHandler(scr.chatId, scr.messageId, scr.reply, scr.mode)
   }
 
   /**
@@ -330,13 +421,22 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
 
   const gesture = (g: Gesture): void => {
     if (g === 'click') {
-      // A double tap may follow — wait out CLICK_DELAY.
+      // A double tap may follow — wait out CLICK_DELAY. That is also what makes
+      // "double tap on SEND? cancels" true: the second tap kills this callback
+      // before any request leaves.
       scheduleClick(() => {
+        // SKIP? is a read mark: it must reach Telegram. Viewing a chat is not,
+        // and nothing here is called for a plain double tap out of CHAT.
+        const skipping = s.screen.kind === 'skipConfirm' ? s.screen : null
+        const skipped = skipping
+          ? messageIdIn(s, skipping.chatId, skipping.msgIndex)
+          : null
         // ux-flow: a tap on an empty CHATS means "check again". With real chats
         // that is a backend round-trip, so the page asks the WebView for it.
         const idle =
           s.telegramConnected && s.screen.kind === 'chats' && visibleChats(s).length === 0
         apply({ type: 'gesture', gesture: 'click' })
+        if (skipping && skipped) readHandler?.(skipping.chatId, skipped)
         if (idle) refreshHandler?.()
       })
       return
@@ -450,6 +550,39 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     publish(next)
   }
 
+  /** The send is over. The answer names its attempt; a stale one is ignored. */
+  function applySend(result: {
+    chatId: string
+    messageId: string
+    ok: boolean
+    at?: string
+    gone?: boolean
+  }): void {
+    sendsInFlight.delete(`${result.chatId}#${result.messageId}`)
+    publish(reduce(s, { type: 'sendResult', ...result }))
+  }
+
+  /**
+   * The read mark did not reach Telegram: that message is still unread there.
+   * Hiding it here would make the glasses' counter disagree with the phone.
+   */
+  function applyUnread(chatId: string, messageId?: string): void {
+    publish(reduce(s, { type: 'unread', chatId, messageId }))
+  }
+
+  function onSend(
+    cb: ((chatId: string, messageId: string, text: string, mode: 'reply' | 'quick') => void) | null,
+  ): void {
+    sendHandler = cb
+    // A handler that arrives while SENDING is already on screen still gets the
+    // message: the first frame must not wait for the next tap.
+    if (cb !== null) maybeRequestSend()
+  }
+
+  function onMark(cb: ((chatId: string, messageId: string) => void) | null): void {
+    readHandler = cb
+  }
+
   // First screen and ticks. StrictMode mounts components twice —
   // createPage is called once per page (see App.tsx).
   requestRender()
@@ -463,6 +596,10 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     onRefresh,
     onReplies,
     applyReplies,
+    onSend,
+    applySend,
+    applyUnread,
+    onMark,
     subscribe(cb) {
       listeners.add(cb)
       return () => {

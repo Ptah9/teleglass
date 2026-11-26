@@ -24,16 +24,20 @@ export type AuthErrorCode =
   | 'network'
   | 'linkExpired'
   | 'llm'
+  | 'send'
   | 'unknown'
 
 /** An error the WebView can name on the screen, not a stack trace. */
 export class AuthError extends Error {
   readonly code: AuthErrorCode
+  /** HTTP status when the backend answered; absent for network and demo. */
+  readonly status?: number
 
-  constructor(code: AuthErrorCode, message?: string) {
+  constructor(code: AuthErrorCode, message?: string, status?: number) {
     super(message ?? code)
     this.name = 'AuthError'
     this.code = code
+    this.status = status
   }
 }
 
@@ -132,6 +136,17 @@ export interface Api {
   replies(chatId: string, messageId: string): Promise<LlmReply>
   /** Models advertised by the backend; `current` is what it would use now. */
   llmModels(): Promise<LlmModels>
+  /**
+   * Sends `text` into the dialog as this account. `messageId` is the message
+   * being answered and anchors Telegram's `random_id`, so a retry after a
+   * timeout does not produce a second message. Any failure is an honest `send`
+   * error (or `network`/`unknown` for auth); the glasses show OFFLINE.
+   */
+  sendReply(chatId: string, messageId: string, text: string): Promise<{ id: string; at: string }>
+  /** Marks one message (and everything older) read on the server side. */
+  markRead(chatId: string, messageId: string): Promise<void>
+  /** Marks the whole dialog read — the QUICK REPLY draft answers every unread. */
+  markChatRead(chatId: string): Promise<void>
   /** true — the demo implementation is in use (no backend answered). */
   readonly demo: boolean
 }

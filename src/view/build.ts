@@ -520,7 +520,8 @@ function sentView(s: AppState, t: TFunc): View {
   const scr = s.screen
   if (scr.kind !== 'sent') return chatsView(s, t)
   const chat = chatById(s, scr.chatId)
-  const stamp = chat ? `${scr.at} · ${cutChars(chat.person, 30)}` : scr.at
+  const person = scr.person ?? chat?.person ?? ''
+  const stamp = person ? `${scr.at} · ${cutChars(person, 30)}` : scr.at
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('sent.title'), level: LVL.main },
     dividerSpec('divider'),

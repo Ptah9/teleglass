@@ -12,8 +12,8 @@
  *   its pending entry in place, so a human retry does not burn another attempt.
  */
 
-import { randomUUID } from 'node:crypto'
-import { Api, password as passwordUtils } from 'teleproto'
+import { createHash, randomUUID } from 'node:crypto'
+import { Api, errors, helpers, password as passwordUtils } from 'teleproto'
 import type { Config } from '../config.js'
 import {
   ContractError,
@@ -46,6 +46,12 @@ const CONNECT_MS = 7_000
  * Telegram ends as `network` from us, not as an aborted request on the phone.
  */
 const REQUEST_BUDGET_MS = 8_500
+/**
+ * The WebView gives a reply 8 s (`SEND_TIMEOUT_MS`). The backend must answer
+ * before that: otherwise a send that did happen is shown as OFFLINE. The retry
+ * is deduped, but the first screen should say the truth.
+ */
+const SEND_BUDGET_MS = 7_500
 
 interface Pending {
   id: string
@@ -580,6 +586,140 @@ export class TelegramAuthService implements AuthService {
     return this.peers.get(this.peerKey(session.id, chatId))?.unread ?? 0
   }
 
+  // ---- sending and read marks ---------------------------------------------
+
+  async sendReply(
+    token: string | null,
+    chatId: string,
+    messageId: string,
+    text: string,
+  ): Promise<{ id: string; at: string }> {
+    const started = Date.now()
+    const session = this.requireSession(token)
+    const clean = text.trim()
+    if (clean.length === 0 || clean.length > 4096) throw new ContractError('unknown', 400)
+    if (!NUMERIC_ID.test(messageId)) throw new ContractError('unknown', 404)
+
+    try {
+      // Inside the try: a connection failure is a failed send too (`send`, 502),
+      // not a bare `network` the contract does not promise here.
+      const client = await this.sessionClient(session, this.left(started, SEND_BUDGET_MS))
+      const entry = await this.peerFor(client, session, chatId, this.left(started, SEND_BUDGET_MS))
+      // The answered message must exist in this dialog: a foreign id is not a
+      // reply target and must not anchor a random_id.
+      await this.assertInChat(
+        client,
+        entry,
+        Number(messageId),
+        this.left(started, SEND_BUDGET_MS),
+      )
+
+      const updates = await this.wait(
+        client.invoke(
+          new Api.messages.SendMessage({
+            peer: entry.peer,
+            message: clean,
+            randomId: sendRandomId(chatId, messageId),
+            noWebpage: true,
+          }),
+        ),
+        this.left(started, SEND_BUDGET_MS),
+      )
+      const sent = sentMessageOf(updates)
+      if (!sent) throw new Error('the send response carried no message id')
+
+      this.persistSession(client, session)
+      const date = sent.date > 0 ? sent.date : Math.floor(Date.now() / 1000)
+      this.log.info('send.ok', { chatId, chars: clean.length, ms: Date.now() - started })
+      return { id: String(sent.id), at: new Date(date * 1000).toISOString() }
+    } catch (err) {
+      if (isSessionDead(err)) {
+        this.dropDeadSession(session)
+        throw new ContractError('unknown', 401)
+      }
+      throw sendFailureOf(err, chatId, this.log)
+    }
+  }
+
+  async markRead(token: string | null, chatId: string, messageId: string): Promise<void> {
+    if (!NUMERIC_ID.test(messageId)) throw new ContractError('unknown', 404)
+    await this.readUpTo(token, chatId, Number(messageId), true)
+  }
+
+  async markChatRead(token: string | null, chatId: string): Promise<void> {
+    await this.readUpTo(token, chatId, 0, false)
+  }
+
+  /**
+   * The id we mark read must be this dialog's message: `readHistory` with a
+   * foreign or invented `max_id` would silently read the whole chat.
+   */
+  private async readUpTo(
+    token: string | null,
+    chatId: string,
+    maxId: number,
+    checkMessage: boolean,
+  ): Promise<void> {
+    const started = Date.now()
+    const session = this.requireSession(token)
+    const client = await this.sessionClient(session, this.left(started))
+    try {
+      const entry = await this.peerFor(client, session, chatId, this.left(started))
+      if (checkMessage) await this.assertInChat(client, entry, maxId, this.left(started))
+      // Channels have their own readHistory request; groups and users use the
+      // messages one. `maxId: 0` means "up to the newest message".
+      const request =
+        entry.peer instanceof Api.InputPeerChannel
+          ? new Api.channels.ReadHistory({ channel: entry.peer, maxId })
+          : new Api.messages.ReadHistory({ peer: entry.peer, maxId })
+      await this.wait(client.invoke(request), this.left(started))
+      // Keep the cached window honest without another dialogs round-trip:
+      // everything up to `maxId` is read, a whole-chat mark clears the counter.
+      // The count is logged before the reset: after it, "0" says nothing.
+      const unread = entry.unread
+      if (maxId > 0) entry.readInboxMaxId = Math.max(entry.readInboxMaxId, maxId)
+      else entry.unread = 0
+      this.persistSession(client, session)
+      this.log.info('read.ok', { chatId, maxId, unread, ms: Date.now() - started })
+    } catch (err) {
+      if (isSessionDead(err)) {
+        this.dropDeadSession(session)
+        throw new ContractError('unknown', 401)
+      }
+      if (err instanceof ContractError && err.status === 404) throw err
+      this.log.warn('read.failed', { chatId, rpc: rpcField(err) })
+      if (err instanceof ContractError) throw err
+      throw new ContractError('unknown', 502)
+    }
+  }
+
+  /**
+   * Does this dialog have a message with this number? Telegram numbers messages
+   * per chat, so a number alone cannot prove which chat it came from; the best
+   * available check is "the newest message below the target is the target".
+   * The page always sends an id from this chat's own feed; a number that is not
+   * in this dialog is a 404 and nothing is sent.
+   */
+  private async assertInChat(
+    client: TgClient,
+    entry: PeerEntry,
+    id: number,
+    ms: number,
+  ): Promise<void> {
+    const target = await this.wait(
+      client.invoke(
+        new Api.messages.GetHistory({
+          peer: entry.peer,
+          offsetId: id + 1,
+          limit: 1,
+          hash: helpers.returnBigInt(0),
+        }),
+      ),
+      ms,
+    )
+    if (!holdsMessage(target, id)) throw new ContractError('unknown', 404)
+  }
+
   // ---- settings / LLM key -------------------------------------------------
 
   async putSettings(token: string | null, payload: SettingsPayload): Promise<void> {
@@ -831,10 +971,10 @@ export class TelegramAuthService implements AuthService {
   }
 
   /** Time left in the whole-request budget, never negative. */
-  private left(started: number): number {
+  private left(started: number, budget = REQUEST_BUDGET_MS): number {
     // No floor: when the budget is gone the request must fail as `network` now,
     // not spend another second per step and drift past the WebView's timeout.
-    return Math.max(0, REQUEST_BUDGET_MS - (Date.now() - started))
+    return Math.max(0, budget - (Date.now() - started))
   }
 
   private async wait<T>(promise: Promise<T>, ms = CALL_MS): Promise<T> {
@@ -882,14 +1022,24 @@ export class TelegramAuthService implements AuthService {
   }
 
   private persistSession(client: TgClient, session: SessionRow): void {
-    const current = client.session.save()
-    if (!current) return
-    // Compare the plaintext: the ciphertext changes on every encryption because
-    // of the fresh IV, so comparing blobs would rewrite the row on every read.
-    const stored = decrypt(session.enc_session, this.config.encKey, `session:${session.id}`)
-    if (stored === current) return
-    session.enc_session = encrypt(current, this.config.encKey, `session:${session.id}`)
-    this.db.saveSession(session)
+    // The stored string is a cache of the auth key, not the result of the RPC:
+    // a failed write must not turn a delivered message or a saved read mark
+    // into an error the glasses show as "not sent".
+    try {
+      const current = client.session.save()
+      if (!current) return
+      // Compare the plaintext: the ciphertext changes on every encryption because
+      // of the fresh IV, so comparing blobs would rewrite the row on every read.
+      const stored = decrypt(session.enc_session, this.config.encKey, `session:${session.id}`)
+      if (stored === current) return
+      session.enc_session = encrypt(current, this.config.encKey, `session:${session.id}`)
+      this.db.saveSession(session)
+    } catch (err) {
+      this.log.warn('session.persist.failed', {
+        userId: session.user_id,
+        rpc: loggableError(err),
+      })
+    }
   }
 
   private dropDeadSession(session: SessionRow): void {
@@ -1145,6 +1295,79 @@ function mergeById(a: Api.TypeMessage[], b: Api.TypeMessage[]): Api.TypeMessage[
   }
   return out
 }
+
+/**
+ * `random_id` from the pair the user repeated, not from the clock: a retry
+ * after a timeout sends the same message once, because Telegram drops an
+ * identical id. This is the only duplicate protection that needs no history.
+ */
+export function sendRandomId(chatId: string, messageId: string) {
+  const bytes = createHash('sha256').update(`${chatId}\u0000${messageId}`).digest().subarray(0, 8)
+  const id = helpers.readBigIntFromBuffer(bytes, false, false)
+  return id.isZero() ? id.add(1) : id
+}
+
+/** The id and time of a sent message out of whichever update Telegram returned. */
+export function sentMessageOf(
+  updates: Api.TypeUpdates,
+): { id: number; date: number } | null {
+  if (updates instanceof Api.UpdateShortSentMessage) {
+    return { id: updates.id, date: updates.date }
+  }
+  if (updates instanceof Api.Updates || updates instanceof Api.UpdatesCombined) {
+    // A private chat answers with `UpdateNewMessage`, a channel with the
+    // channel flavour: both carry the full message, id and server time.
+    for (const update of updates.updates) {
+      if (update instanceof Api.UpdateNewMessage || update instanceof Api.UpdateNewChannelMessage) {
+        const message = update.message
+        if (message instanceof Api.Message) return { id: message.id, date: message.date }
+      }
+    }
+    // `UpdateMessageID` has the id but no time; it is the last resort.
+    for (const update of updates.updates) {
+      if (update instanceof Api.UpdateMessageID) return { id: update.id, date: 0 }
+    }
+  }
+  return null
+}
+
+/**
+ * The wire answer for a failed send. A foreign id stays `404` (the client's
+ * mistake, not a Telegram failure); a flood is logged with its seconds and is
+ * never retried automatically; everything else — including a timeout — is a
+ * failed send, because the glasses only need the verdict.
+ */
+export function sendFailureOf(err: unknown, chatId: string, log: Logger): ContractError {
+  if (err instanceof errors.FloodWaitError) {
+    log.warn('send.flood', { chatId, seconds: err.seconds })
+    return new ContractError('send', 502)
+  }
+  if (err instanceof ContractError && err.status === 404) return err
+  log.warn('send.failed', { chatId, rpc: rpcField(err) })
+  return new ContractError('send', 502)
+}
+
+/**
+ * The `rpc` log field: our own contract code for our own refusals (a bare
+ * `ContractError` name says nothing about a timeout), the RPC tag otherwise.
+ */
+export function rpcField(err: unknown): string {
+  return err instanceof ContractError ? err.code : loggableError(err)
+}
+
+/**
+ * Whether a `messages.getHistory` answer holds exactly this id. With
+ * `offsetId = id + 1, limit: 1` the first row is the newest message below the
+ * target, so it equals the target only when this dialog has that number.
+ */
+export function holdsMessage(response: unknown, id: number): boolean {
+  if (!response || typeof response !== 'object' || !('messages' in response)) return false
+  const rows = (response as { messages?: Array<{ id?: unknown }> }).messages
+  return Array.isArray(rows) && rows[0]?.id === id
+}
+
+/** A Telegram message id is a positive integer; anything else is not ours. */
+const NUMERIC_ID = /^\d{1,20}$/
 
 function messageKey(message: Api.TypeMessage): string {
   return message instanceof Api.Message ? String(message.id) : ''

@@ -17,6 +17,7 @@ export type AuthErrorCode =
   | 'network'
   | 'linkExpired'
   | 'llm'
+  | 'send'
   | 'unknown'
 
 /** `types.ts` `AuthState`. `token` travels only when a login just completed. */
@@ -118,6 +119,7 @@ export function isAuthErrorCode(value: unknown): value is AuthErrorCode {
     value === 'network' ||
     value === 'linkExpired' ||
     value === 'llm' ||
+    value === 'send' ||
     value === 'unknown'
   )
 }

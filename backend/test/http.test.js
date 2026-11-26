@@ -54,6 +54,19 @@ function makeService(overrides = {}) {
     async putSettings(token, payload) {
       calls.push(['putSettings', token, payload])
     },
+    async unreadCount() {
+      return 0
+    },
+    async sendReply(token, chatId, messageId, text) {
+      calls.push(['sendReply', token, chatId, messageId, text])
+      return { id: '42', at: '2026-01-01T10:00:00.000Z' }
+    },
+    async markRead(token, chatId, messageId) {
+      calls.push(['markRead', token, chatId, messageId])
+    },
+    async markChatRead(token, chatId) {
+      calls.push(['markChatRead', token, chatId])
+    },
     async setLlmKey(token, key) {
       calls.push(['setLlmKey', token, key])
     },
@@ -374,4 +387,135 @@ test('unknown routes are 404 with the contract error shape', async () => {
   const response = await handle(deps(service), request('GET', '/nope'))
   assert.equal(response.status, 404)
   assert.deepEqual(JSON.parse(response.body), { error: 'unknown' })
+})
+
+test('POST /chats/:id/send carries the text and answers id and time', async () => {
+  const { service, calls } = makeService()
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/send', {
+      token: 't',
+      body: JSON.stringify({ messageId: '7', text: 'Привет' }),
+    }),
+  )
+  assert.equal(response.status, 200)
+  assert.deepEqual(JSON.parse(response.body), { id: '42', at: '2026-01-01T10:00:00.000Z' })
+  assert.deepEqual(calls.at(-1), ['sendReply', 't', 'user:1', '7', 'Привет'])
+})
+
+test('POST /send refuses a blank text before Telegram is touched', async () => {
+  const { service, calls } = makeService()
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/send', {
+      token: 't',
+      body: JSON.stringify({ messageId: '7', text: '   \n ' }),
+    }),
+  )
+  assert.equal(response.status, 400)
+  assert.deepEqual(JSON.parse(response.body), { error: 'unknown' })
+  assert.equal(calls.length, 0)
+})
+
+test('POST /read marks one message and answers 204', async () => {
+  const { service, calls } = makeService()
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/read', {
+      token: 't',
+      body: JSON.stringify({ messageId: '7' }),
+    }),
+  )
+  assert.equal(response.status, 204)
+  assert.equal(response.body, '')
+  assert.deepEqual(calls.at(-1), ['markRead', 't', 'user:1', '7'])
+})
+
+test('POST /read with an empty body marks the whole chat', async () => {
+  const { service, calls } = makeService()
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/read', { token: 't', body: '{}' }),
+  )
+  assert.equal(response.status, 204)
+  assert.deepEqual(calls.at(-1), ['markChatRead', 't', 'user:1'])
+})
+
+test('POST /send without a bearer is 401 and the send is refused', async () => {
+  const { service, calls } = makeService({
+    async sendReply(token) {
+      calls.push(['sendReply', token])
+      throw new ContractError('unknown', 401)
+    },
+  })
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/send', {
+      body: JSON.stringify({ messageId: '7', text: 'hi' }),
+    }),
+  )
+  assert.equal(response.status, 401)
+  // The handler refuses without a bearer before the service is asked: the stub
+  // would have recorded a call if the request had been passed on.
+  assert.equal(calls.length, 0)
+})
+
+test('POST /send maps a refused send to 502 send', async () => {
+  const { service } = makeService({
+    async sendReply() {
+      throw new ContractError('send', 502)
+    },
+  })
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/send', {
+      token: 't',
+      body: JSON.stringify({ messageId: '7', text: 'hi' }),
+    }),
+  )
+  assert.equal(response.status, 502)
+  assert.deepEqual(JSON.parse(response.body), { error: 'send' })
+})
+
+test('POST /send keeps a foreign chat or message at 404', async () => {
+  const { service } = makeService({
+    async sendReply() {
+      throw new ContractError('unknown', 404)
+    },
+  })
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A999/send', {
+      token: 't',
+      body: JSON.stringify({ messageId: '7', text: 'hi' }),
+    }),
+  )
+  assert.equal(response.status, 404)
+  assert.deepEqual(JSON.parse(response.body), { error: 'unknown' })
+})
+
+test('POST /send refuses more than 4096 characters', async () => {
+  const { service, calls } = makeService()
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/send', {
+      token: 't',
+      body: JSON.stringify({ messageId: '7', text: 'x'.repeat(4097) }),
+    }),
+  )
+  assert.equal(response.status, 400)
+  assert.equal(calls.length, 0)
+})
+
+test('POST /read with a non-string messageId is a 400, not a whole chat', async () => {
+  const { service, calls } = makeService()
+  const response = await handle(
+    deps(service),
+    request('POST', '/chats/user%3A1/read', {
+      token: 't',
+      body: JSON.stringify({ messageId: 7 }),
+    }),
+  )
+  assert.equal(response.status, 400)
+  assert.equal(calls.length, 0)
 })

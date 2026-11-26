@@ -88,6 +88,32 @@ async function dispatch(
     if (chatId !== null) return json(200, await deps.auth.messages(token, chatId))
   }
 
+  if (method === 'POST') {
+    const action = chatActionPath(path)
+    if (action !== null) {
+      // The contract says "no session — 401": without credentials the body is
+      // not the first thing to judge.
+      if (!token) throw new ContractError('unknown', 401)
+      if (action.action === 'send') {
+        const body = parseJson(request.body)
+        const messageId = requireString(body, 'messageId')
+        // A number that long cannot exist in any dialog: the same answer as a
+        // foreign id, not a shape error.
+        if (messageId.length > 32) throw new ContractError('unknown', 404)
+        const text = requireText(body, 'text')
+        return json(200, await deps.auth.sendReply(token, action.chatId, messageId, text))
+      }
+      const body = parseJson(request.body)
+      if ('messageId' in body) {
+        // A present but non-string id is a client bug, not "the whole chat".
+        await deps.auth.markRead(token, action.chatId, requireString(body, 'messageId'))
+      } else {
+        await deps.auth.markChatRead(token, action.chatId)
+      }
+      return noContent()
+    }
+  }
+
   switch (route) {
     case 'GET /health': {
       const health = await deps.auth.health()
@@ -185,6 +211,15 @@ function json(status: number, value: unknown): OutgoingResponse {
   }
 }
 
+/** 204: the read mark has no body, and the client does not need one. */
+function noContent(): OutgoingResponse {
+  return {
+    status: 204,
+    headers: { 'Cache-Control': 'no-store' },
+    body: '',
+  }
+}
+
 function routePath(raw: string): string {
   let path = raw.split('?')[0] ?? '/'
   if (path === '/api' || path.startsWith('/api/')) path = path.slice(4)
@@ -203,6 +238,22 @@ function messagesPath(path: string): string | null {
   try {
     const chatId = decodeURIComponent(match[1])
     return chatId.length > 0 && chatId.length <= 96 ? chatId : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * `/chats/<id>/send` and `/chats/<id>/read` — the two POST routes that carry a
+ * chat id. Percent-encoded for the same reason as `messagesPath`.
+ */
+function chatActionPath(path: string): { chatId: string; action: 'send' | 'read' } | null {
+  const match = /^\/chats\/([^/]+)\/(send|read)$/.exec(path)
+  if (!match?.[1] || !match[2]) return null
+  try {
+    const chatId = decodeURIComponent(match[1])
+    if (chatId.length === 0 || chatId.length > 96) return null
+    return { chatId, action: match[2] === 'send' ? 'send' : 'read' }
   } catch {
     return null
   }
@@ -249,6 +300,19 @@ function requireString(body: Record<string, unknown>, key: string): string {
     throw new ContractError('unknown')
   }
   return value
+}
+
+/**
+ * A reply body: up to Telegram's 4096 characters, and a blank one is a client
+ * bug (`400`), not a message to send.
+ */
+function requireText(body: Record<string, unknown>, key: string): string {
+  const value = body[key]
+  // Limits apply to what would actually be sent: the text is trimmed by the
+  // service, so 5000 characters of padding around a short line are legal.
+  const clean = typeof value === 'string' ? value.trim() : ''
+  if (clean.length === 0 || clean.length > 4096) throw new ContractError('unknown', 400)
+  return clean
 }
 
 function readSettings(body: Record<string, unknown>): SettingsPayload {

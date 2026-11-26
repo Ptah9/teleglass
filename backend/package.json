@@ -1,7 +1,7 @@
 {
   "name": "teleglass-backend",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Teleglass backend: MTProto through teleproto, HTTP API for the phone WebView, SQLite storage",
   "type": "module",
   "main": "dist/index.js",

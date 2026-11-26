@@ -1,16 +1,36 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { Api, errors } from 'teleproto'
+import { ContractError } from '../dist/contract.js'
+import { Logger } from '../dist/log.js'
 import {
   chatIdOf,
   chatSummaryOf,
   forwardQuery,
   historyQuery,
+  holdsMessage,
   messageQuery,
   messageSummaryOf,
   normalizePhone,
   oldestMessageId,
   prettyPhone,
+  sendFailureOf,
+  sendRandomId,
+  sentMessageOf,
 } from '../dist/tg/service.js'
+
+/** Collects log lines so a test can assert on the event and the fields. */
+function captureLog() {
+  const lines = []
+  const log = new Logger('warn', {
+    write(chunk) {
+      lines.push(JSON.parse(chunk))
+      return true
+    },
+  })
+  const events = () => lines.map((line) => line.event)
+  return { log, lines, events }
+}
 
 function dialog(overrides = {}) {
   return {
@@ -91,6 +111,74 @@ test('the LLM history walks back from the oldest fetched message, capped', () =>
 test('the history anchor is the oldest fetched id, not the newest', () => {
   assert.equal(oldestMessageId([{ id: 12 }, { id: 7 }, { id: 0 }]), 7)
   assert.equal(oldestMessageId([]), 0)
+})
+
+test('random_id is deterministic and different for every pair', () => {
+  const first = sendRandomId('user:1', '7').toString()
+  assert.equal(sendRandomId('user:1', '7').toString(), first)
+  assert.notEqual(sendRandomId('user:1', '8').toString(), first)
+  assert.notEqual(sendRandomId('user:2', '7').toString(), first)
+  assert.notEqual(first, '0')
+})
+
+test('a flood on send is 502 send, logged with its seconds and never retried', () => {
+  const { log, events, lines } = captureLog()
+  const err = sendFailureOf(
+    new errors.FloodWaitError({ capture: 7, request: null }),
+    'user:1',
+    log,
+  )
+  assert.equal(err.code, 'send')
+  assert.equal(err.status, 502)
+  assert.deepEqual(events(), ['send.flood'])
+  assert.equal(lines[0].seconds, 7)
+})
+
+test('a foreign message id stays 404 and is not logged as a failed send', () => {
+  const { log, lines } = captureLog()
+  const notFound = new ContractError('unknown', 404)
+  assert.equal(sendFailureOf(notFound, 'user:1', log), notFound)
+  assert.deepEqual(lines, [])
+})
+
+test('any other send refusal is 502 send and logged', () => {
+  const { log, events, lines } = captureLog()
+  const err = sendFailureOf(new Error('socket closed'), 'user:1', log)
+  assert.equal(err.code, 'send')
+  assert.equal(err.status, 502)
+  assert.deepEqual(events(), ['send.failed'])
+  // The event carries the RPC name, never the reply text.
+  assert.equal(typeof lines[0].rpc, 'string')
+})
+
+test('getHistory holds the target only when the first row is that id', () => {
+  assert.equal(holdsMessage({ messages: [{ id: 7 }] }, 7), true)
+  // offsetId = id + 1, limit 1 returns the newest message below the target;
+  // a different id means the target is not in this dialog.
+  assert.equal(holdsMessage({ messages: [{ id: 6 }] }, 7), false)
+  assert.equal(holdsMessage({ messages: [] }, 7), false)
+  assert.equal(
+    holdsMessage(new Api.messages.Messages({ messages: [], chats: [], users: [] }), 7),
+    false,
+  )
+  assert.equal(holdsMessage(null, 7), false)
+})
+
+test('the sent message id is read from both update shapes', () => {
+  const short = new Api.UpdateShortSentMessage({ id: 9, date: 1_700_000_000, pts: 1, ptsCount: 1 })
+  assert.deepEqual(sentMessageOf(short), { id: 9, date: 1_700_000_000 })
+
+  const updates = new Api.Updates({
+    updates: [new Api.UpdateMessageID({ id: 11 })],
+    users: [],
+    chats: [],
+    date: 1,
+    seq: 0,
+  })
+  assert.deepEqual(sentMessageOf(updates), { id: 11, date: 0 })
+
+  const empty = new Api.Updates({ updates: [], users: [], chats: [], date: 1, seq: 0 })
+  assert.equal(sentMessageOf(empty), null)
 })
 
 test('a message becomes an ISO stamp, its own newlines and an out flag', () => {

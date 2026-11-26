@@ -5,12 +5,13 @@ pick with a gesture → confirm → send. One WebView serves both surfaces: the
 phone (login and settings) and the glasses (a render target driven by Even Hub
 containers).
 
-**v0.5.0 — a working LLM on real conversations.** The phone signs in to Telegram
+**v0.6.0 — replies go out, read marks stick.** The phone signs in to Telegram
 through the backend (MTProto, no Bot API stand-in), the glasses list is the
-account's unread dialogs with their real messages, and opening a message fetches
-a real summary and three reply options from the provider configured on the
-backend. Still mock: sending from the glasses and read marks (v0.6), and the
-demo set used before a link exists (`src/api/demo.ts`).
+account's unread dialogs with their real messages, opening a message fetches a
+real summary and three reply options, and the chosen reply is sent to Telegram
+from the glasses: `SENT` is Telegram's own message id and time, `SKIP?` marks up
+to that message read, and viewing a chat marks nothing. Still mock: the demo set
+used before a link exists (`src/api/demo.ts`).
 
 What is real in this version:
 
@@ -21,7 +22,15 @@ What is real in this version:
   the backend; the session and the keys stay there, the WebView holds only a
   bearer token;
 - the backend speaks MTProto through `teleproto`: `GET /chats`,
-  `GET /chats/:id/messages`, sessions in SQLite under `backend/data/`;
+  `GET /chats/:id/messages`, `POST /chats/:id/send`, `POST /chats/:id/read`,
+  sessions in SQLite under `backend/data/`;
+- a reply picked on the glasses is sent for real: `SENT` carries Telegram's
+  message id and time, a retry reuses `random_id` so it cannot become a second
+  message, and a refusal is an honest `OFFLINE` with a retry, never a fake
+  receipt;
+- read marks are server-side too: a reply or `SKIP?` marks up to that message in
+  Telegram, a `QUICK REPLY` marks the whole chat, and opening a chat marks
+  nothing; a failed mark comes back on the glasses instead of hiding an unread;
 - the LLM speaks an OpenAI-compatible API configured by `.env`: three reply
   options and a summary for the message being answered, in the language of that
   message, with the tone from T3, cached for 24 hours; a failure is an honest
@@ -136,14 +145,16 @@ implementation is `src/api/client.ts`.
 | `DELETE` | `/api/data` | remove the session and stored data |
 | `GET` | `/api/chats` | `[{ id, title, preview, unread }]` for T1 and the glasses feed |
 | `GET` | `/api/chats/:id/messages` | last messages of one dialog, oldest first: `[{ id, at, text, out, media? }]` |
+| `POST` | `/api/chats/:id/send` | `{ messageId, text }` → `{ id, at }`; `random_id` comes from the pair, so a retry does not duplicate; a refusal is 502 `{ error: "send" }` |
+| `POST` | `/api/chats/:id/read` | `{ messageId }` marks one message (and older) read, `{}` marks the chat; both 204 and idempotent |
 | `PUT` | `/api/settings` | mirror `{ lang, quickReply, tone, selectedChats, llmModel }` for the LLM |
 | `POST` | `/api/llm/key` | `{ apiKey }` — the backend stores the key; the WebView never keeps it |
-| `POST` | `/api/llm/replies` | `{ chatId, messageId }` → `{ summary, replies }`; a failure is 502 `{ error: "llm" }` |
+| `POST` | `/api/llm/replies` | `{ chatId, messageId }` → `{ summary, replies }`; a failure is 502 `{ error: "llm" }`, one request in flight per chat and 20 a minute per session is 429 `{ error: "llm" }` |
 | `GET` | `/api/llm/models` | `{ models: [{ id, label }], current }` for the T3 picker |
 
 The session token comes back as `token` and is kept in `localStorage` under
 `teleglass.token`; it goes to our backend only, never to Telegram. Errors are
-`{ "error": "wrongCode" | "expiredCode" | "tooMany" | "wrongPassword" | ... }`.
+`{ "error": "wrongCode" | "expiredCode" | "tooMany" | "wrongPassword" | "send" | ... }`.
 
 The LLM API key is one-way: it goes to the backend through `/api/llm/key`, the
 field is cleared immediately, and nothing about the key lands in `localStorage`.

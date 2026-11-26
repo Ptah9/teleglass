@@ -547,3 +547,67 @@ test('replacing the account drops the LLM cache', () => {
     s.close()
   }
 })
+
+test('the reply endpoint admits twenty a minute per session', async () => {
+  const client = clientOf([answer])
+  const s = setup({ messages: [message(1, 'Привет')], client })
+  const realNow = Date.now
+  let now = realNow()
+  Date.now = () => now
+  try {
+    for (let i = 0; i < 20; i++) {
+      // A missing message id is a 404 after the slot is taken: the budget is
+      // spent the same way a real request spends it.
+      await assert.rejects(
+        s.service.replies(TOKEN, 'user:1', String(100 + i)),
+        (err) => err instanceof ContractError && err.code === 'unknown',
+      )
+    }
+    await assert.rejects(
+      s.service.replies(TOKEN, 'user:1', '1'),
+      (err) => err instanceof ContractError && err.code === 'llm' && err.status === 429,
+    )
+    // The window is one minute, not twenty forever: a minute later the budget
+    // is fresh. Without moving the clock this test would pass even if it never ran out.
+    now += 61_000
+    await assert.rejects(
+      s.service.replies(TOKEN, 'user:1', '999'),
+      (err) => err instanceof ContractError && err.code === 'unknown',
+    )
+  } finally {
+    Date.now = realNow
+    s.close()
+  }
+})
+
+test('one request per chat: a second while the first is in flight is 429', async () => {
+  let open = () => {}
+  const gate = new Promise((resolve) => {
+    open = resolve
+  })
+  let inside = () => {}
+  const entered = new Promise((resolve) => {
+    inside = resolve
+  })
+  const client = {
+    async complete() {
+      inside()
+      await gate
+      return answer
+    },
+  }
+  const s = setup({ messages: [message(1, 'Привет')], client })
+  try {
+    const first = s.service.replies(TOKEN, 'user:1', '1')
+    await entered
+    await assert.rejects(
+      s.service.replies(TOKEN, 'user:1', '1'),
+      (err) => err instanceof ContractError && err.code === 'llm' && err.status === 429,
+    )
+    open()
+    const result = await first
+    assert.equal(result.replies.length, 3)
+  } finally {
+    s.close()
+  }
+})

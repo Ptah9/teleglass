@@ -60,6 +60,28 @@ export type AppEvent =
       summary: string
       replies: string[]
     }
+  /**
+   * The WebView finished a real send. The page cannot fetch, so the answer — or
+   * the failure — arrives as an event and resolves the SENDING screen. The
+   * attempt is named by `chatId#messageId`: a late answer for an older attempt
+   * must never put its receipt on a newer one. `at` is Telegram's time for SENT;
+   * `ok: false` becomes OFFLINE, never a fake SENT.
+   */
+  | {
+      type: 'sendResult'
+      chatId: string
+      messageId: string
+      ok: boolean
+      at?: string
+      /** The message is gone (`404`/`400`): retrying cannot help, so not OFFLINE. */
+      gone?: boolean
+    }
+  /**
+   * A read mark did not reach Telegram (network, 502): the message is still
+   * unread there, so the glasses must stop hiding it. With `messageId`, only
+   * what that mark would have covered is brought back.
+   */
+  | { type: 'unread'; chatId: string; messageId?: string }
   | { type: 'tick'; now: number }
 
 /** Message from Telegram. A mock in v0.1; the summary field appears when the text is long. */
@@ -129,12 +151,25 @@ export type Screen =
       chatId: string
       /** The answered message. Absent for the QUICK REPLY draft (whole chat). */
       msgIndex?: number
+      /**
+       * Telegram id of the anchor, taken once at the tap. Every retry of this
+       * attempt sends the same pair, so `random_id` (and the dedupe) holds even
+       * if the feed under the screen has changed.
+       */
+      messageId: string
       reply: string
       mode: 'reply' | 'quick'
       startAt: number
     }
-  | { kind: 'sent'; chatId: string; reply: string; at: string }
-  | { kind: 'offline'; chatId: string; msgIndex?: number; reply: string }
+  | { kind: 'sent'; chatId: string; reply: string; at: string; person?: string }
+  | {
+      kind: 'offline'
+      chatId: string
+      msgIndex?: number
+      /** The same anchor the failed attempt used: the retry must not pick a new one. */
+      messageId: string
+      reply: string
+    }
   | {
       kind: 'listening'
       chatId: string
@@ -200,8 +235,16 @@ export interface AppState {
   /**
    * Flashing CHATS footer line: `sent · X` for 2 seconds,
    * `not sent · hold to retry` for NOT_SENT_MS (both arrive as a deadline).
+   * `messageId` is the anchor the failed quick reply used: the retry must keep
+   * it, otherwise a feed refresh would change `random_id` and send a duplicate.
    */
-  flash: { key: 'sent' | 'notSent'; person: string; chatId: string; until: number } | null
+  flash: {
+    key: 'sent' | 'notSent'
+    person: string
+    chatId: string
+    messageId?: string
+    until: number
+  } | null
   /** chatId whose CHATS row currently shows sending… */
   sendingRow: string | null
   /** Queue of "new" messages for the "check again" gesture on an empty CHATS. */

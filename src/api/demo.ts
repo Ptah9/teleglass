@@ -29,6 +29,31 @@ const CODE_EXPIRED = '000000'
 const MAX_ATTEMPTS = 3
 const LINK_MS = 30_000
 
+/**
+ * What the demo sends and marks, for the life of the WebView. Not persisted:
+ * the mock chats are regenerated on load, so a stored id would point at
+ * nothing. The point is that `sendReply`/`markRead` mean the same thing here as
+ * on the backend, so the glasses take the same road in both modes.
+ */
+interface DemoSent {
+  chatId: string
+  id: string
+  at: string
+  text: string
+}
+const demoSent: DemoSent[] = []
+const demoRead: Record<string, true> = {}
+let demoSentSeq = 0
+
+export interface DemoApiOptions {
+  /**
+   * The demo was picked because the backend did not answer (not by a flag).
+   * Then the LLM is unreachable, not "not configured": `off` would claim a
+   * verdict on a key nobody has read.
+   */
+  backendDown?: boolean
+}
+
 interface StoredAuth {
   step: 'idle' | 'code' | 'password' | 'link' | 'connected'
   phone?: string
@@ -85,16 +110,19 @@ function network(): never {
   throw new AuthError('network', 'demo: no backend')
 }
 
-export function createDemoApi(): Api {
+export function createDemoApi(options: DemoApiOptions = {}): Api {
   return {
     demo: true,
 
     async health(): Promise<Health> {
       await sleep(320)
       if (hasDemoFlag('status-error')) {
-        return { backend: 'error', llm: 'off', checkedAt: new Date().toISOString() }
+        return { backend: 'error', llm: 'error', checkedAt: new Date().toISOString() }
       }
-      return { backend: 'demo', llm: 'off', checkedAt: new Date().toISOString() }
+      // No server, no LLM: `error` when the backend is the missing part, `off`
+      // for a demo that never had one.
+      const llm = options.backendDown ? 'error' : 'off'
+      return { backend: 'demo', llm, checkedAt: new Date().toISOString() }
     },
 
     async auth(): Promise<AuthState> {
@@ -195,12 +223,62 @@ export function createDemoApi(): Api {
       await sleep(120)
       const chat = MOCK_CHATS.find((item) => item.id === chatId)
       if (!chat) return []
-      return chat.messages.map((message) => ({
-        id: message.id,
-        at: message.at,
-        text: message.text,
-        out: false,
-      }))
+      return [
+        ...chat.messages
+          .filter((message) => !demoRead[message.id])
+          .map((message) => ({
+            id: message.id,
+            at: message.at,
+            text: message.text,
+            out: false,
+          })),
+        ...demoSent
+          .filter((message) => message.chatId === chatId)
+          .map((message) => ({ id: message.id, at: message.at, text: message.text, out: true })),
+      ]
+    },
+
+    async sendReply(chatId: string, messageId: string, text: string) {
+      // `?demo=send-error` reaches OFFLINE without a backend, like the demo
+      // lever for the feed. No text is echoed: the demo has no logs to leak.
+      await sleep(hasDemoFlag('send-error') ? 900 : 450)
+      if (hasDemoFlag('send-error')) throw new AuthError('send')
+
+      const chat = MOCK_CHATS.find((item) => item.id === chatId)
+      if (!chat) throw new AuthError('unknown', undefined, 404)
+      const clean = text.trim()
+      if (clean.length === 0 || clean.length > 4096) throw new AuthError('unknown', undefined, 400)
+      // Same rule as the backend: the answered message has to belong to this
+      // dialog. A foreign id is a 404, not a send.
+      if (!chat.messages.some((message) => message.id === messageId)) {
+        throw new AuthError('unknown', undefined, 404)
+      }
+
+      demoSentSeq += 1
+      const record = {
+        chatId,
+        id: `demo-sent-${demoSentSeq}`,
+        at: new Date().toISOString(),
+        text: clean,
+      }
+      demoSent.push(record)
+      return { id: record.id, at: record.at }
+    },
+
+    async markRead(chatId: string, messageId: string): Promise<void> {
+      await sleep(80)
+      const chat = MOCK_CHATS.find((item) => item.id === chatId)
+      if (!chat || !chat.messages.some((message) => message.id === messageId)) {
+        throw new AuthError('unknown')
+      }
+      demoRead[messageId] = true
+    },
+
+    async markChatRead(chatId: string): Promise<void> {
+      await sleep(80)
+      const chat = MOCK_CHATS.find((item) => item.id === chatId)
+      if (!chat) throw new AuthError('unknown')
+      for (const message of chat.messages) demoRead[message.id] = true
     },
 
     async putSettings(): Promise<void> {

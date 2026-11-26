@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import { HEALTH_EVENT, UNAUTHORIZED_EVENT } from './api/client'
 import { hasDemoFlag } from './api/demo-flags'
+import { AuthError } from './api/types'
 import { DebugPanel } from './dev/DebugPanel'
 import { loadFeed } from './even/feed'
 import { getPage, type Page } from './even/page'
@@ -116,8 +117,11 @@ export default function App() {
       do {
         feedAgain.current = false
         // A background refresh keeps the list the user already sees; "checking"
-        // is only honest when there is nothing to show yet.
-        const known = page.state().feedStatus === 'ready'
+        // is only honest when there is nothing to show yet. The demo set is a
+        // list too: going through "loading" would drop the read map and bring
+        // back the chat that was just answered.
+        const feed = page.state().feedStatus
+        const known = feed === 'ready' || feed === 'demo'
         if (!known) page.applyChats('loading', null)
         try {
           const snapshot = await loadFeed(settings.selectedChats)
@@ -172,6 +176,62 @@ export default function App() {
     })
     return () => page.onReplies(null)
   }, [page])
+
+  /**
+   * SENDING asks the WebView to send: the demo answers from its own data, the
+   * backend from Telegram. Either way the page only shows the result — a
+   * rejection is OFFLINE with a retry, never a fake SENT.
+   */
+  useEffect(() => {
+    if (!page) return
+    page.onSend((chatId, messageId, text, mode) => {
+      void api
+        .sendReply(chatId, messageId, text)
+        .then((sent) => {
+          page.applySend({ chatId, messageId, ok: true, at: sent.at })
+          // SENT does not wait for the mark (ux-flow § Подтверждения), but the
+          // refreshed feed must see it: reload after the mark has settled.
+          const marked =
+            mode === 'quick' ? api.markChatRead(chatId) : api.markRead(chatId, messageId)
+          marked
+            .then(undefined, (err: unknown) => {
+              // Telegram still counts it unread, so the glasses must stop
+              // hiding it instead of showing a counter that is not true.
+              console.warn('[teleglass] the read mark was not saved:', err)
+              page.applyUnread(chatId, mode === 'quick' ? undefined : messageId)
+            })
+            .finally(() => void reloadFeed())
+        })
+        .catch((err: unknown) => {
+          // No text in the log: the reply is the user's, not diagnostics.
+          console.warn('[teleglass] the reply was not sent:', err)
+          // 400/404 will not change on a retry: leave SENDING for CHATS instead
+          // of OFFLINE, whose only action is a retry that cannot work.
+          const gone = err instanceof AuthError && (err.status === 400 || err.status === 404)
+          page.applySend({ chatId, messageId, ok: false, gone })
+          if (gone) void reloadFeed()
+        })
+    })
+    return () => page.onSend(null)
+  }, [page, reloadFeed])
+
+  /**
+   * SKIP? marks one message read, and only that one. Opening a chat or leaving
+   * it with a double tap marks nothing (Антон, 24.11: viewing ≠ reading).
+   */
+  useEffect(() => {
+    if (!page) return
+    page.onMark((chatId, messageId) => {
+      void api.markRead(chatId, messageId).catch((err: unknown) => {
+        // The phone still shows it unread: put it back on the glasses and take
+        // the server's list as the truth.
+        console.warn('[teleglass] the read mark was not saved:', err)
+        page.applyUnread(chatId, messageId)
+        void reloadFeed()
+      })
+    })
+    return () => page.onMark(null)
+  }, [page, reloadFeed])
 
   /**
    * Does the backend have an LLM? `off` means no key: REPLIES must say "LLM not

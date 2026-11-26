@@ -36,7 +36,7 @@ const BODY_LINES = LINES.BODY_LINES
 const CHATS_MAX = LINES.CHATS_MAX
 /** Indicator columns kept in state (shared with the view). */
 const WAVE_LEN = LINES.WAVE_LEN
-/** Mock "sending to Telegram" delay. */
+/** The demo lever "backend not responding" fails SENDING after this delay. */
 const SEND_MS = 1500
 /** A recording shorter than 0.8 s counts as failed (demo rule for HEARD "did not catch it"). */
 const MIN_RECORD_MS = 800
@@ -78,6 +78,14 @@ export function chatById(s: AppState, id: string): MockChat | undefined {
   return s.chats.find((c) => c.id === id)
 }
 
+/**
+ * Telegram id of a message. Demo messages have none, so the mock id stands in:
+ * the demo API resolves it locally, and the key stays stable either way.
+ */
+export function anchorId(message: MockMessage | undefined): string {
+  return message ? (message.remoteId ?? message.id) : ''
+}
+
 export function unreadMsgs(chat: MockChat, read: Record<string, true>): MockMessage[] {
   return chat.messages.filter((m) => !read[m.id])
 }
@@ -103,8 +111,8 @@ export function timeStr(d: Date = new Date()): string {
 /**
  * The read map lives as long as the page. A few thousand message ids is a day
  * of heavy use; older entries are dropped so the map cannot grow without bound.
- * Until `markRead` exists (v0.6) Telegram still counts those messages unread, so
- * a dropped id can come back; the cap is about memory, not about forgetting.
+ * Since v0.6 the server is told about every mark (`readHistory`), so a dropped
+ * id stays read on Telegram even when the page loses it from memory.
  */
 const READ_CAP = 2_000
 
@@ -128,9 +136,65 @@ function markAllRead(s: AppState, chatId: string): Record<string, true> {
 function markMessageRead(s: AppState, chatId: string, msgIndex: number): Record<string, true> {
   const chat = chatById(s, chatId)
   if (!chat) return s.read
-  const msg = unreadMsgs(chat, s.read)[msgIndex]
-  if (!msg) return s.read
-  return capRead({ ...s.read, [msg.id]: true })
+  // `readHistory(max_id)` reads everything up to the message, not one message
+  // (task-v0.6 §3: "Telegram пометит всё до него включительно"). The local map
+  // mirrors that, otherwise the counters on the glasses and in Telegram drift
+  // apart until the next feed refresh.
+  const read = { ...s.read }
+  const unread = unreadMsgs(chat, s.read)
+  for (let i = 0; i <= msgIndex; i++) {
+    const msg = unread[i]
+    if (msg) read[msg.id] = true
+  }
+  return capRead(read)
+}
+
+/**
+ * Telegram's `readHistory(max_id)` covers the anchor and everything older. By
+ * id, not by index: a feed refresh may shift the unread window under the
+ * attempt, and the index would then point at another message. If the message is
+ * no longer in the window, the server mark still stands and the next feed shows it.
+ */
+function markUpToMessage(s: AppState, chatId: string, messageId: string): Record<string, true> {
+  const chat = chatById(s, chatId)
+  if (!chat) return s.read
+  const at = chat.messages.findIndex((m) => (m.remoteId ?? m.id) === messageId)
+  if (at < 0) return s.read
+  const read = { ...s.read }
+  for (let i = 0; i <= at; i++) read[chat.messages[i].id] = true
+  return capRead(read)
+}
+
+/**
+ * The read mark did not reach Telegram. The message is unread there, so the
+ * glasses must stop hiding it instead of showing a counter that is not true.
+ * With a message id, only what `readHistory(max_id)` would have covered is
+ * brought back — one failed mark must not resurrect the whole chat.
+ */
+function unmarkChat(s: AppState, chatId: string, messageId?: string): AppState {
+  const chat = chatById(s, chatId)
+  if (!chat) return s
+  const limit =
+    messageId !== undefined && /^\d+$/.test(messageId) ? Number(messageId) : null
+  let changed = false
+  const read = { ...s.read }
+  for (const msg of chat.messages) {
+    if (!read[msg.id]) continue
+    const id = msg.remoteId ?? msg.id
+    // No id: the whole chat failed to mark. A numeric id: readHistory(max_id)
+    // covered it and everything older. A demo id has no order, so only the
+    // message itself can be the one the mark was about.
+    const covered =
+      messageId === undefined
+        ? true
+        : limit !== null
+          ? /^\d+$/.test(id) && Number(id) <= limit
+          : id === messageId
+    if (!covered) continue
+    delete read[msg.id]
+    changed = true
+  }
+  return changed ? { ...s, read } : s
 }
 
 function isLongMessage(msg: MockMessage): boolean {
@@ -165,6 +229,10 @@ export function reduce(s: AppState, e: AppEvent): AppState {
       return onFeed(s, e.status, e.chats, e.merge === true)
     case 'llmReplies':
       return onLlmReplies(s, e)
+    case 'sendResult':
+      return onSendResult(s, e)
+    case 'unread':
+      return unmarkChat(s, e.chatId, e.messageId)
     case 'tick':
       return onTick(s, e.now)
   }
@@ -245,7 +313,9 @@ function onFeed(s: AppState, status: FeedStatus, chats: MockChat[] | null, merge
   const screen =
     status === 'ready'
       ? (remapScreen(s, next) ?? { kind: 'chats' as const })
-      : s.screen.kind === 'chats'
+      : // A receipt is not a chat screen: neither a demo refresh nor a lost list
+        // may replace SENT before the tap that leaves it.
+        s.screen.kind === 'chats' || s.screen.kind === 'sent'
         ? s.screen
         : ({ kind: 'chats' } as const)
 
@@ -267,7 +337,11 @@ function onFeed(s: AppState, status: FeedStatus, chats: MockChat[] | null, merge
     ...candidate,
     selChat,
     lastChecked: status === 'ready' || status === 'demo' ? timeStr() : s.lastChecked,
-    flash: s.flash && ids.has(s.flash.chatId) ? s.flash : null,
+    // A receipt is shown for its two seconds even when the chat has just left
+    // the list (the reply marked it read); "not sent" only makes sense while
+    // the chat is still there.
+    flash:
+      s.flash && (s.flash.key === 'sent' || ids.has(s.flash.chatId)) ? s.flash : null,
     sendingRow: s.sendingRow && ids.has(s.sendingRow) ? s.sendingRow : null,
     phoneRead: s.phoneRead && ids.has(s.phoneRead) ? s.phoneRead : null,
   }
@@ -323,12 +397,20 @@ function withLlmData(old: MockChat[], fresh: MockChat[]): MockChat[] {
 function remapScreen(s: AppState, next: MockChat[]): Screen | null {
   const screen = s.screen
   if (screen.kind === 'chats') return screen
+  // SENT is a receipt, not a chat screen: the reply marked the message read,
+  // so this chat may already have left the refreshed feed, and the receipt
+  // still belongs on screen until the tap.
+  if (screen.kind === 'sent') return screen
+  // An attempt carries its own anchor, taken at the tap: a feed refresh under
+  // SENDING/OFFLINE must not drop the screen (and with it the receipt or the
+  // retry), and a quick reply must not keep the row at `sending…` forever.
+  if (screen.kind === 'sending' || screen.kind === 'offline') return screen
   const chat = next.find((item) => item.id === screen.chatId)
   if (!chat) return null
 
   // These screens do not point at one message, or point at the chat only:
   // keeping them is safe as long as the chat still exists.
-  if (screen.kind === 'sent' || screen.kind === 'quickConfirm' || screen.kind === 'chatEmpty') {
+  if (screen.kind === 'quickConfirm' || screen.kind === 'chatEmpty') {
     return screen
   }
 
@@ -377,6 +459,9 @@ function onChats(s: AppState, g: Gesture): AppState {
           screen: {
             kind: 'sending',
             chatId: chat.id,
+            // The anchor of the failed attempt, not the newest message: a feed
+            // refresh under the flash would otherwise send a second copy.
+            messageId: s.flash.messageId ?? anchorId(chat.messages[chat.messages.length - 1]),
             reply: s.quickReplyText,
             mode: 'quick',
             startAt: Date.now(),
@@ -681,18 +766,22 @@ function onConfirm(s: AppState, g: Gesture): AppState {
   const scr = s.screen
   if (scr.kind !== 'confirm') return s
   switch (g) {
-    case 'click':
+    case 'click': {
+      const chat = chatById(s, scr.chatId)
+      const message = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
       return {
         ...s,
         screen: {
           kind: 'sending',
           chatId: scr.chatId,
           msgIndex: scr.msgIndex,
+          messageId: anchorId(message),
           reply: scr.reply,
           mode: 'reply',
           startAt: Date.now(),
         },
       }
+    }
     case 'doubleClick':
     case 'swipeUp':
       // "No" — back where the reply came from: the transcript must not be lost
@@ -719,18 +808,21 @@ function onQuickConfirm(s: AppState, g: Gesture): AppState {
   const scr = s.screen
   if (scr.kind !== 'quickConfirm') return s
   switch (g) {
-    case 'click':
+    case 'click': {
+      const chat = chatById(s, scr.chatId)
       return {
         ...s,
         sendingRow: scr.chatId,
         screen: {
           kind: 'sending',
           chatId: scr.chatId,
+          messageId: anchorId(chat?.messages[chat.messages.length - 1]),
           reply: s.quickReplyText,
           mode: 'quick',
           startAt: Date.now(),
         },
       }
+    }
     case 'doubleClick':
     case 'swipeUp':
       return chatsScreen(s)
@@ -744,12 +836,17 @@ function onSkipConfirm(s: AppState, g: Gesture): AppState {
   if (scr.kind !== 'skipConfirm') return s
   switch (g) {
     case 'click': {
-      // Skip: mark as read and drop from the list. The other messages of the
-      // chat are untouched — the chat disappears once the unread pool runs out.
+      // Skip: mark as read and drop from the list. `readHistory` reads up to
+      // this message, so the local map does the same; the chat disappears once
+      // the unread pool runs out.
       const chat = chatById(s, scr.chatId)
       const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
       if (!msg) return chatsScreen(s)
-      return { ...s, read: { ...s.read, [msg.id]: true }, screen: { kind: 'chats' } }
+      return {
+        ...s,
+        read: markMessageRead(s, scr.chatId, scr.msgIndex),
+        screen: { kind: 'chats' },
+      }
     }
     case 'doubleClick':
     case 'swipeUp':
@@ -775,13 +872,15 @@ function onOffline(s: AppState, g: Gesture): AppState {
   if (scr.kind !== 'offline') return s
   switch (g) {
     case 'click':
-      // Tap — retry (error.hint).
+      // Tap — retry (error.hint). The anchor is the one the failed attempt
+      // used: a new one would get a new `random_id`.
       return {
         ...s,
         screen: {
           kind: 'sending',
           chatId: scr.chatId,
           msgIndex: scr.msgIndex,
+          messageId: scr.messageId,
           reply: scr.reply,
           mode: 'reply',
           startAt: Date.now(),
@@ -1029,8 +1128,9 @@ function onMenu(s: AppState, item: number): AppState {
 function onTick(s: AppState, now: number): AppState {
   let next = s
 
-  if (next.screen.kind === 'sending' && now - next.screen.startAt >= SEND_MS) {
-    next = resolveSending(next, now)
+  if (next.screen.kind === 'sending' && next.backendDown && now - next.screen.startAt >= SEND_MS) {
+    // Only the demo lever fails by the clock; a real send waits for its answer.
+    next = finishSending(next, now, false)
   }
 
   // The LISTENING indicator is driven by microphone chunks (`audio` events);
@@ -1061,13 +1161,33 @@ function onMicSource(s: AppState, source: AudioSource): AppState {
   return { ...s, screen: { ...scr, source } }
 }
 
-function resolveSending(s: AppState, now: number): AppState {
+/**
+ * A real send is resolved by the WebView's answer, never by the clock. The
+ * clock is left for the demo lever "backend not responding" only, and it can
+ * only produce a failure — no timer may claim SENT.
+ */
+function onSendResult(s: AppState, e: Extract<AppEvent, { type: 'sendResult' }>): AppState {
+  const scr = s.screen
+  if (scr.kind !== 'sending' || scr.chatId !== e.chatId || scr.messageId !== e.messageId) {
+    // A late answer for an older attempt: it must not put its receipt on the
+    // send that is on screen now.
+    return s
+  }
+  if (e.gone === true) {
+    // The message (or the chat) is not there any more: a retry can only 404
+    // again. Leave SENDING without a "not sent" flash that invites one.
+    return { ...s, sendingRow: null, screen: { kind: 'chats' } }
+  }
+  return finishSending(s, Date.now(), e.ok, e.at)
+}
+
+function finishSending(s: AppState, now: number, ok: boolean, at?: string): AppState {
   const scr = s.screen
   if (scr.kind !== 'sending') return s
   const chat = chatById(s, scr.chatId)
   const person = chat?.person ?? ''
 
-  if (s.backendDown) {
+  if (!ok) {
     if (scr.mode === 'reply') {
       return {
         ...s,
@@ -1075,17 +1195,24 @@ function resolveSending(s: AppState, now: number): AppState {
           kind: 'offline',
           chatId: scr.chatId,
           msgIndex: scr.msgIndex,
+          messageId: scr.messageId,
           reply: scr.reply,
         },
       }
     }
     // The quick reply did not go through: the chat stays, the footer shows
-    // "not sent · hold to retry" for NOT_SENT_MS — long enough to read and to
+    // "not sent — hold to retry" for NOT_SENT_MS — long enough to read and to
     // retry, short enough not to become a permanent screen state.
     return {
       ...s,
       sendingRow: null,
-      flash: { key: 'notSent', person, chatId: scr.chatId, until: now + LINES.NOT_SENT_MS },
+      flash: {
+        key: 'notSent',
+        person,
+        chatId: scr.chatId,
+        messageId: scr.messageId,
+        until: now + LINES.NOT_SENT_MS,
+      },
       screen: { kind: 'chats' },
     }
   }
@@ -1094,15 +1221,24 @@ function resolveSending(s: AppState, now: number): AppState {
   // unread messages keep the chat in the list. The QUICK REPLY draft answers
   // the chat as a whole, so it clears every message (ux-flow § Что происходит).
   const read =
-    scr.mode === 'quick' || scr.msgIndex === undefined
+    scr.mode === 'quick'
       ? markAllRead(s, scr.chatId)
-      : markMessageRead(s, scr.chatId, scr.msgIndex)
+      : markUpToMessage(s, scr.chatId, scr.messageId)
 
   if (scr.mode === 'reply') {
+    const when = at ? new Date(at) : new Date(now)
+    // The person travels with the receipt: after the reply the feed is
+    // refreshed and this chat may already be gone from it.
     return {
       ...s,
       read,
-      screen: { kind: 'sent', chatId: scr.chatId, reply: scr.reply, at: timeStr(new Date(now)) },
+      screen: {
+        kind: 'sent',
+        chatId: scr.chatId,
+        reply: scr.reply,
+        at: timeStr(Number.isNaN(when.getTime()) ? new Date(now) : when),
+        person,
+      },
     }
   }
 

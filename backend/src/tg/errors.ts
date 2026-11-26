@@ -1,7 +1,7 @@
 /**
- * Telegram failures become the seven contract codes and nothing else.
- * The WebView never sees an RPC error body: only `wrongCode`, `expiredCode`,
- * `tooMany`, `wrongPassword`, `network`, `linkExpired`, `unknown`.
+ * Telegram failures become the contract codes and nothing else. The WebView
+ * never sees an RPC error body: only `wrongCode`, `expiredCode`, `tooMany`,
+ * `wrongPassword`, `network`, `linkExpired`, `llm`, `send`, `unknown`.
  */
 
 import { ContractError, type AuthErrorCode } from '../contract.js'
@@ -116,5 +116,7 @@ export const CONTRACT_CODES: readonly AuthErrorCode[] = [
   'wrongPassword',
   'network',
   'linkExpired',
+  'llm',
+  'send',
   'unknown',
 ]

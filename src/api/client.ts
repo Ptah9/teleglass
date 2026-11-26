@@ -26,6 +26,8 @@ import {
  *   DELETE /data
  *   GET    /chats                  → ChatSummary[]
  *   GET    /chats/:id/messages     → MessageSummary[] (oldest first)
+ *   POST   /chats/:id/send         {messageId, text} → { id, at }
+ *   POST   /chats/:id/read         {messageId} or {} → 204
  *   PUT    /settings               { lang, quickReply, tone, selectedChats, llmModel }
  *   POST   /llm/key      {apiKey}  → the backend validates and stores the key
  *   POST   /llm/replies  {chatId, messageId} → { summary, replies }
@@ -41,6 +43,13 @@ import {
 
 const TOKEN_KEY = 'teleglass.token'
 const TIMEOUT_MS = 10_000
+/**
+ * A reply must not keep the glasses on SENDING longer than the 8 s the task
+ * allows (task-v0.6 §3). The backend answers inside 7.5 s (`SEND_BUDGET_MS`), so
+ * OFFLINE is our verdict, not an aborted fetch; a retry reuses `random_id`, so
+ * an aborted-but-delivered send does not become a second message.
+ */
+const SEND_TIMEOUT_MS = 8_000
 /**
  * A request came back 401: the token is dead or the Telegram session is gone.
  * The app listens for this and drops the "connected" flag; the client cannot
@@ -60,6 +69,7 @@ const ERROR_CODES: readonly AuthErrorCode[] = [
   'network',
   'linkExpired',
   'llm',
+  'send',
   'unknown',
 ]
 
@@ -88,9 +98,14 @@ function clearToken(): void {
   }
 }
 
-async function request<T>(base: string, path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(
+  base: string,
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = TIMEOUT_MS,
+): Promise<T> {
   const controller = new AbortController()
-  const timer = window.setTimeout(() => controller.abort(), TIMEOUT_MS)
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
   const headers = new Headers(init.headers)
   headers.set('Accept', 'application/json')
   if (init.body !== undefined) headers.set('Content-Type', 'application/json')
@@ -129,7 +144,7 @@ async function request<T>(base: string, path: string, init: RequestInit = {}): P
         ? (body as { error?: unknown }).error
         : undefined
     const code = ERROR_CODES.find((c) => c === raw) ?? 'unknown'
-    throw new AuthError(code)
+    throw new AuthError(code, undefined, response.status)
   }
 
   return body as T
@@ -284,6 +299,33 @@ export function createRealApi(base: string): Api {
             ...(r.media === true ? { media: true } : {}),
           },
         ]
+      })
+    },
+
+    async sendReply(chatId: string, messageId: string, text: string) {
+      const body = await request<unknown>(
+        base,
+        `/chats/${encodeURIComponent(chatId)}/send`,
+        { method: 'POST', body: JSON.stringify({ messageId, text }) },
+        SEND_TIMEOUT_MS,
+      )
+      const raw = body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
+      if (typeof raw.id !== 'string' || typeof raw.at !== 'string') throw new AuthError('send')
+      return { id: raw.id, at: raw.at }
+    },
+
+    async markRead(chatId: string, messageId: string) {
+      await request(
+        base,
+        `/chats/${encodeURIComponent(chatId)}/read`,
+        { method: 'POST', body: JSON.stringify({ messageId }) },
+      )
+    },
+
+    async markChatRead(chatId: string) {
+      await request(base, `/chats/${encodeURIComponent(chatId)}/read`, {
+        method: 'POST',
+        body: '{}',
       })
     },
 

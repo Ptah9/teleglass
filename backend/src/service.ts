@@ -57,6 +57,24 @@ export interface AuthService {
    */
   unreadCount(token: string | null, chatId: string): Promise<number>
 
+  /**
+   * Sends one text into a dialog this account already sees. `messageId` is the
+   * message being answered: it anchors the deterministic `random_id`, so a
+   * retry after a timeout does not create a second message.
+   */
+  sendReply(
+    token: string | null,
+    chatId: string,
+    messageId: string,
+    text: string,
+  ): Promise<{ id: string; at: string }>
+
+  /** Marks one message read (and everything older in that dialog). */
+  markRead(token: string | null, chatId: string, messageId: string): Promise<void>
+
+  /** Marks the whole dialog read; the QUICK REPLY draft answers the chat. */
+  markChatRead(token: string | null, chatId: string): Promise<void>
+
   putSettings(token: string | null, payload: SettingsPayload): Promise<void>
   setLlmKey(token: string | null, apiKey: string): Promise<void>
 

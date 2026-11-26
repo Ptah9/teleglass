@@ -58,7 +58,8 @@ async function probe(): Promise<Api> {
     return remember(createRealApi(base))
   }
   console.warn('[teleglass] API: backend did not answer at', base, '— demo mode')
-  return remember(createDemoApi())
+  // Labelled demo, but the LLM is not "off": there is no server to ask.
+  return remember(createDemoApi({ backendDown: true }))
 }
 
 function ready(): Promise<Api> {
@@ -81,6 +82,10 @@ export const api: Api = {
   deleteAll: async () => (await ready()).deleteAll(),
   chats: async () => (await ready()).chats(),
   messages: async (chatId) => (await ready()).messages(chatId),
+  sendReply: async (chatId, messageId, text) =>
+    (await ready()).sendReply(chatId, messageId, text),
+  markRead: async (chatId, messageId) => (await ready()).markRead(chatId, messageId),
+  markChatRead: async (chatId) => (await ready()).markChatRead(chatId),
   putSettings: async (payload) => (await ready()).putSettings(payload),
   setLlmKey: async (apiKey) => (await ready()).setLlmKey(apiKey),
   replies: async (chatId, messageId) => (await ready()).replies(chatId, messageId),

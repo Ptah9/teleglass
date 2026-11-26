@@ -6,9 +6,9 @@ import type { FeedStatus, MockChat, MockMessage } from '../state/types'
  * The bridge from the real account to the glasses list.
  *
  * The glasses show unread messages only (ux-flow.md), so the feed is exactly the
- * chats Telegram reports unread plus their last messages. Reading is decided by
- * the page's own `read` map; the backend is not told about it yet — `markRead`
- * is v0.6, and until then a listed chat stays unread on the phone.
+ * chats Telegram reports unread plus their last messages. The page keeps its own
+ * `read` map for the current window; since v0.6 every mark is also sent to the
+ * backend (`readHistory`), so a listed chat is read on the phone too.
  *
  * The status is carried next to the chats: `demo` is the mock set, `ready` is
  * the real list (possibly empty), `error` means the list could not be built.
