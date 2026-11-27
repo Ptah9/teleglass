@@ -98,6 +98,34 @@ function makeLlm(overrides = {}) {
   return { llm, calls }
 }
 
+function makeStt(overrides = {}) {
+  const calls = []
+  const stt = {
+    async transcribe(token, audio, format) {
+      calls.push(['transcribe', token, audio.length, format])
+      return { text: 'hello', durationMs: 1000 }
+    },
+    async transcribeMessage(token, chatId, messageId) {
+      calls.push(['transcribeMessage', token, chatId, messageId])
+      return { text: 'voice text' }
+    },
+    ...overrides,
+  }
+  return { stt, calls }
+}
+
+function makeVoice(overrides = {}) {
+  const calls = []
+  const voice = {
+    async send(token, chatId, messageId, audio) {
+      calls.push(['send', token, chatId, messageId, audio.length])
+      return { id: '77', at: '2026-01-01T10:00:00.000Z' }
+    },
+    ...overrides,
+  }
+  return { voice, calls }
+}
+
 function request(method, path, { token, body, origin } = {}) {
   const headers = {}
   if (token) headers.authorization = `Bearer ${token}`
@@ -105,8 +133,14 @@ function request(method, path, { token, body, origin } = {}) {
   return { method, path, headers, body: body === undefined ? '' : body }
 }
 
-function deps(service, corsOrigins = ['http://localhost:5173'], llm = makeLlm().llm) {
-  return { auth: service, llm, log: silent, corsOrigins }
+function deps(
+  service,
+  corsOrigins = ['http://localhost:5173'],
+  llm = makeLlm().llm,
+  stt = makeStt().stt,
+  voice = makeVoice().voice,
+) {
+  return { auth: service, llm, stt, voice, log: silent, corsOrigins }
 }
 
 test('GET /health answers the probe', async () => {
@@ -518,4 +552,100 @@ test('POST /read with a non-string messageId is a 400, not a whole chat', async 
   )
   assert.equal(response.status, 400)
   assert.equal(calls.length, 0)
+})
+
+test('POST /stt passes the audio and the format to the recognizer', async () => {
+  const { service } = makeService()
+  const { stt, calls } = makeStt()
+  const audio = Buffer.alloc(640).toString('base64')
+  const response = await handle(
+    deps(service, undefined, undefined, stt),
+    request('POST', '/stt', { token: 't', body: JSON.stringify({ audio, format: 'pcm' }) }),
+  )
+  assert.equal(response.status, 200)
+  assert.deepEqual(JSON.parse(response.body), { text: 'hello', durationMs: 1000 })
+  assert.deepEqual(calls.at(-1), ['transcribe', 't', audio.length, 'pcm'])
+})
+
+test('POST /stt without audio or format never reaches the recognizer', async () => {
+  const { service } = makeService()
+  const { stt, calls } = makeStt()
+  for (const body of ['{"format":"pcm"}', '{"audio":"AAAA"}', '{"audio":"","format":"pcm"}']) {
+    const response = await handle(
+      deps(service, undefined, undefined, stt),
+      request('POST', '/stt', { token: 't', body }),
+    )
+    assert.equal(response.status, 400)
+  }
+  assert.equal(calls.length, 0)
+})
+
+test('POST /stt without a bearer is 401 before the body is judged', async () => {
+  const { service } = makeService()
+  const { stt, calls } = makeStt()
+  const response = await handle(
+    deps(service, undefined, undefined, stt),
+    request('POST', '/stt', { body: '{}' }),
+  )
+  assert.equal(response.status, 401)
+  assert.equal(calls.length, 0)
+})
+
+test('POST /stt maps a dead provider to 502 stt', async () => {
+  const { service } = makeService()
+  const { stt } = makeStt({
+    async transcribe() {
+      throw new ContractError('stt', 502)
+    },
+  })
+  const response = await handle(
+    deps(service, undefined, undefined, stt),
+    request('POST', '/stt', {
+      token: 't',
+      body: JSON.stringify({ audio: 'AAAA', format: 'pcm' }),
+    }),
+  )
+  assert.equal(response.status, 502)
+  assert.deepEqual(JSON.parse(response.body), { error: 'stt' })
+})
+
+test('POST /chats/:id/voice carries the audio and answers id and time', async () => {
+  const { service } = makeService()
+  const { voice, calls } = makeVoice()
+  const audio = Buffer.alloc(320).toString('base64')
+  const response = await handle(
+    deps(service, undefined, undefined, undefined, voice),
+    request('POST', '/chats/user%3A1/voice', {
+      token: 't',
+      body: JSON.stringify({ messageId: '7', audio }),
+    }),
+  )
+  assert.equal(response.status, 200)
+  assert.deepEqual(JSON.parse(response.body), { id: '77', at: '2026-01-01T10:00:00.000Z' })
+  assert.deepEqual(calls.at(-1), ['send', 't', 'user:1', '7', audio.length])
+})
+
+test('POST /voice without a bearer is 401 before the audio is judged', async () => {
+  const { service } = makeService()
+  const { voice, calls } = makeVoice()
+  const response = await handle(
+    deps(service, undefined, undefined, undefined, voice),
+    request('POST', '/chats/user%3A1/voice', {
+      body: JSON.stringify({ messageId: '7', audio: 'AAAA' }),
+    }),
+  )
+  assert.equal(response.status, 401)
+  assert.equal(calls.length, 0)
+})
+
+test('POST /messages/:id/transcribe decodes both ids', async () => {
+  const { service } = makeService()
+  const { stt, calls } = makeStt()
+  const response = await handle(
+    deps(service, undefined, undefined, stt),
+    request('POST', '/api/chats/user%3A1/messages/42/transcribe', { token: 't' }),
+  )
+  assert.equal(response.status, 200)
+  assert.deepEqual(JSON.parse(response.body), { text: 'voice text' })
+  assert.deepEqual(calls.at(-1), ['transcribeMessage', 't', 'user:1', '42'])
 })

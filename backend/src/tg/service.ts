@@ -13,7 +13,9 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { Api, errors, helpers, password as passwordUtils } from 'teleproto'
+import { CustomFile } from 'teleproto/client/uploads'
 import type { Config } from '../config.js'
 import {
   ContractError,
@@ -27,7 +29,7 @@ import {
 import { decrypt, encrypt } from '../crypto.js'
 import { Db, type SessionRow } from '../db.js'
 import { maskPhone, stripControl, type Logger } from '../log.js'
-import type { AuthService } from '../service.js'
+import type { AuthService, VoiceAudio, VoiceFile } from '../service.js'
 import { raceTimeout } from '../timeout.js'
 import { hashToken, newBearerToken } from '../tokens.js'
 import { ClientRegistry, type TgClient } from './clients.js'
@@ -52,6 +54,29 @@ const REQUEST_BUDGET_MS = 8_500
  * is deduped, but the first screen should say the truth.
  */
 const SEND_BUDGET_MS = 7_500
+/**
+ * Voice is heavier than text: a download or an upload of a 120 s note needs
+ * more than the text budget. The WebView waits 43 s for a transcript and 21 s
+ * for a voice send, both above these budgets.
+ */
+const VOICE_BUDGET_MS = 12_000
+/** Recognizing an incoming note also waits for this download; it is small. */
+const VOICE_DOWNLOAD_MS = 8_000
+
+/**
+ * A voice note is a document whose author sets the size, and the page asks for
+ * a transcript of every unread note by itself. An oversized "voice" therefore
+ * reaches memory without anyone asking: refuse it before the download, not
+ * after. Telegram's own recording cap is one minute; ten is already hostile.
+ */
+const MAX_VOICE_BYTES = 8 * 1024 * 1024
+const MAX_VOICE_SECONDS = 600
+
+/** TL `long` arrives as BigInteger; a size beyond 2^53 is a hostile file anyway. */
+function sizeOf(value: unknown): number {
+  const n = Number(String(value ?? 0))
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
 
 interface Pending {
   id: string
@@ -650,6 +675,11 @@ export class TelegramAuthService implements AuthService {
     await this.readUpTo(token, chatId, 0, false)
   }
 
+  /** The stored session behind a bearer token; `null` for an unknown token. */
+  sessionId(token: string | null): string | null {
+    return token ? this.sessionOfToken(token)?.id ?? null : null
+  }
+
   /**
    * The id we mark read must be this dialog's message: `readHistory` with a
    * foreign or invented `max_id` would silently read the whole chat.
@@ -718,6 +748,180 @@ export class TelegramAuthService implements AuthService {
       ms,
     )
     if (!holdsMessage(target, id)) throw new ContractError('unknown', 404)
+  }
+
+  // ---- voice --------------------------------------------------------------
+
+  /**
+   * Bytes of one voice message. The id must belong to this dialog (same check
+   * as a reply anchor); a text message, a photo or a sticker is `400`: there is
+   * nothing to recognize.
+   */
+  async voiceMessageOf(
+    token: string | null,
+    chatId: string,
+    messageId: string,
+  ): Promise<VoiceAudio> {
+    const started = Date.now()
+    const session = this.requireSession(token)
+    if (!NUMERIC_ID.test(messageId)) throw new ContractError('unknown', 404)
+
+    try {
+      const client = await this.sessionClient(session, this.left(started, VOICE_DOWNLOAD_MS))
+      const entry = await this.peerFor(client, session, chatId, this.left(started, VOICE_DOWNLOAD_MS))
+      const message = await this.messageInChat(
+        client,
+        entry,
+        Number(messageId),
+        this.left(started, VOICE_DOWNLOAD_MS),
+      )
+
+      const media = message.media
+      const document = media instanceof Api.MessageMediaDocument ? media.document : undefined
+      if (!(document instanceof Api.Document)) throw new ContractError('unknown', 400)
+
+      let voice = false
+      let duration = 0
+      for (const attribute of document.attributes) {
+        if (attribute instanceof Api.DocumentAttributeAudio) {
+          voice = attribute.voice === true
+          duration = typeof attribute.duration === 'number' ? attribute.duration : 0
+        }
+      }
+      if (!voice) throw new ContractError('unknown', 400)
+      const bytes = sizeOf(document.size)
+      if (bytes > MAX_VOICE_BYTES || duration > MAX_VOICE_SECONDS) {
+        // Nothing is downloaded: the page keeps the media word on screen, and
+        // the log says why without naming the peer or the file.
+        this.log.warn('voice.refused', { chatId, bytes, seconds: duration })
+        throw new ContractError('unknown', 400)
+      }
+
+      const downloaded = await this.wait(
+        client.downloadMedia(message, {}),
+        this.left(started, VOICE_DOWNLOAD_MS),
+      )
+      const audio = Buffer.isBuffer(downloaded)
+        ? downloaded
+        : typeof downloaded === 'string'
+          ? await readFile(downloaded)
+          : null
+      if (!audio || audio.length === 0) throw new Error('the download returned no bytes')
+
+      this.persistSession(client, session)
+      return { audio, mime: document.mimeType || 'audio/ogg', durationSec: duration }
+    } catch (err) {
+      if (isSessionDead(err)) {
+        this.dropDeadSession(session)
+        throw new ContractError('unknown', 401)
+      }
+      if (err instanceof ContractError) throw err
+      this.log.warn('voice.failed', { chatId, reason: 'download', rpc: rpcField(err) })
+      throw new ContractError('stt', 502)
+    }
+  }
+
+  /**
+   * The uploaded Ogg Opus file as a voice note. `random_id` is stable for the
+   * pair (a retry cannot duplicate) and namespaced away from the text one:
+   * Telegram dedupes across media types and would return the text message.
+   */
+  async sendVoiceFile(
+    token: string | null,
+    chatId: string,
+    messageId: string,
+    file: VoiceFile,
+  ): Promise<{ id: string; at: string }> {
+    const started = Date.now()
+    const session = this.requireSession(token)
+    if (!NUMERIC_ID.test(messageId)) throw new ContractError('unknown', 404)
+
+    try {
+      // Inside the try: a connection failure is a failed send (`send`, 502),
+      // not a bare `network` the contract does not promise here.
+      const client = await this.sessionClient(session, this.left(started, VOICE_BUDGET_MS))
+      const entry = await this.peerFor(client, session, chatId, this.left(started, VOICE_BUDGET_MS))
+      await this.assertInChat(
+        client,
+        entry,
+        Number(messageId),
+        this.left(started, VOICE_BUDGET_MS),
+      )
+
+      const uploaded = await this.wait(
+        client.uploadFile({
+          file: new CustomFile('voice.ogg', file.size, file.path),
+          workers: 1,
+        }),
+        this.left(started, VOICE_BUDGET_MS),
+      )
+      const updates = await this.wait(
+        client.invoke(
+          new Api.messages.SendMedia({
+            peer: entry.peer,
+            media: new Api.InputMediaUploadedDocument({
+              file: uploaded,
+              mimeType: 'audio/ogg',
+              attributes: [
+                new Api.DocumentAttributeAudio({
+                  voice: true,
+                  duration: Math.max(1, Math.round(file.durationSec)),
+                }),
+              ],
+            }),
+            message: '',
+            randomId: voiceRandomId(chatId, messageId),
+          }),
+        ),
+        this.left(started, VOICE_BUDGET_MS),
+      )
+      const sent = sentMessageOf(updates)
+      if (!sent) throw new Error('the send response carried no message id')
+
+      this.persistSession(client, session)
+      const date = sent.date > 0 ? sent.date : Math.floor(Date.now() / 1000)
+      this.log.info('voice.ok', {
+        chatId,
+        seconds: Math.round(file.durationSec),
+        ms: Date.now() - started,
+      })
+      return { id: String(sent.id), at: new Date(date * 1000).toISOString() }
+    } catch (err) {
+      if (isSessionDead(err)) {
+        this.dropDeadSession(session)
+        throw new ContractError('unknown', 401)
+      }
+      throw voiceFailureOf(err, chatId, this.log)
+    }
+  }
+
+  /** The message itself, or `404` when this dialog has no such number. */
+  private async messageInChat(
+    client: TgClient,
+    entry: PeerEntry,
+    id: number,
+    ms: number,
+  ): Promise<Api.Message> {
+    const target = await this.wait(
+      client.invoke(
+        new Api.messages.GetHistory({
+          peer: entry.peer,
+          offsetId: id + 1,
+          limit: 1,
+          hash: helpers.returnBigInt(0),
+        }),
+      ),
+      ms,
+    )
+    const rows =
+      target && typeof target === 'object' && 'messages' in target
+        ? (target as { messages?: unknown }).messages
+        : undefined
+    const first = Array.isArray(rows) ? rows[0] : undefined
+    if (!holdsMessage(target, id) || !(first instanceof Api.Message)) {
+      throw new ContractError('unknown', 404)
+    }
+    return first
   }
 
   // ---- settings / LLM key -------------------------------------------------
@@ -1307,6 +1511,16 @@ export function sendRandomId(chatId: string, messageId: string) {
   return id.isZero() ? id.add(1) : id
 }
 
+/**
+ * A voice note gets its own namespace. Telegram dedupes a `random_id` across
+ * media types, not per kind: reusing the text one made the recording return the
+ * text message that was just sent instead of delivering (found live, 27.11).
+ * Retries of the voice note still repeat this same id, so they cannot duplicate.
+ */
+export function voiceRandomId(chatId: string, messageId: string) {
+  return sendRandomId(chatId, `${messageId}\u0000voice`)
+}
+
 /** The id and time of a sent message out of whichever update Telegram returned. */
 export function sentMessageOf(
   updates: Api.TypeUpdates,
@@ -1344,6 +1558,21 @@ export function sendFailureOf(err: unknown, chatId: string, log: Logger): Contra
   }
   if (err instanceof ContractError && err.status === 404) return err
   log.warn('send.failed', { chatId, rpc: rpcField(err) })
+  return new ContractError('send', 502)
+}
+
+/**
+ * The wire answer for a failed voice send: a foreign id stays `404`, a flood is
+ * logged with its seconds and never retried, everything else is `502 send` —
+ * the glasses show OFFLINE with a retry that keeps the same `random_id`.
+ */
+export function voiceFailureOf(err: unknown, chatId: string, log: Logger): ContractError {
+  if (err instanceof errors.FloodWaitError) {
+    log.warn('voice.flood', { chatId, seconds: err.seconds })
+    return new ContractError('send', 502)
+  }
+  if (err instanceof ContractError && err.status === 404) return err
+  log.warn('voice.failed', { chatId, rpc: rpcField(err) })
   return new ContractError('send', 502)
 }
 
@@ -1387,7 +1616,21 @@ export function messageSummaryOf(message: Api.Message): MessageSummary {
     // `text` is a media word for a photo/sticker/voice: the LLM language rule
     // must not read "Photo" as English.
     media: !(typeof rawText === 'string' && rawText.trim().length > 0),
+    // A voice note is the one media kind that becomes text: the page has to
+    // know before opening the message (task v0.7 §5).
+    ...(isVoiceMessage(message) ? { voice: true } : {}),
   }
+}
+
+/** A Telegram voice note (an audio file with `voice: true`), not any audio. */
+function isVoiceMessage(message: Api.TypeMessage): boolean {
+  const media = (message as { media?: unknown }).media
+  if (!(media instanceof Api.MessageMediaDocument)) return false
+  const document = media.document
+  if (!(document instanceof Api.Document)) return false
+  return document.attributes.some(
+    (attribute) => attribute instanceof Api.DocumentAttributeAudio && attribute.voice === true,
+  )
 }
 
 function messageTextOf(message: Api.TypeMessage): string {
@@ -1465,3 +1708,4 @@ function oneLine(text: string): string {
   const flat = stripControl(text).replace(/\s+/g, ' ').trim()
   return flat.length > 120 ? `${flat.slice(0, 119)}…` : flat
 }
+

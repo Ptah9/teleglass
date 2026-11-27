@@ -37,7 +37,7 @@ const NARROW_PX = {
 }
 
 /** Context-menu items are limited by UTF-8 bytes, not pixels. */
-const BYTE_LIMIT = ['demo.lang', 'demo.backend', 'demo.mic']
+const BYTE_LIMIT = ['demo.lang', 'demo.backend']
 
 /**
  * Phone labels are not measured with `pretext`: it carries the glasses font

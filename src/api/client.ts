@@ -1,6 +1,7 @@
 import {
   AuthError,
   type Api,
+  type AudioFormat,
   type AuthErrorCode,
   type AuthState,
   type ChatSummary,
@@ -8,6 +9,7 @@ import {
   type LlmModels,
   type LlmReply,
   type MessageSummary,
+  type Transcript,
 } from './types'
 
 /**
@@ -28,6 +30,9 @@ import {
  *   GET    /chats/:id/messages     → MessageSummary[] (oldest first)
  *   POST   /chats/:id/send         {messageId, text} → { id, at }
  *   POST   /chats/:id/read         {messageId} or {} → 204
+ *   POST   /chats/:id/voice        {messageId, audio} → { id, at }
+ *   POST   /chats/:id/messages/:messageId/transcribe → { text }
+ *   POST   /stt          {audio, format} → { text, durationMs }
  *   PUT    /settings               { lang, quickReply, tone, selectedChats, llmModel }
  *   POST   /llm/key      {apiKey}  → the backend validates and stores the key
  *   POST   /llm/replies  {chatId, messageId} → { summary, replies }
@@ -51,6 +56,24 @@ const TIMEOUT_MS = 10_000
  */
 const SEND_TIMEOUT_MS = 8_000
 /**
+ * Recognition normally takes 2–3 s; the provider budget now scales with the
+ * recording up to 25 s, so the phone waits a little longer than the backend and
+ * gets our `502 stt` rather than an aborted fetch.
+ */
+const STT_TIMEOUT_MS = 27_000
+/**
+ * A transcript of an incoming voice note includes the Telegram download (8 s),
+ * the ffmpeg pass (8 s) and up to 25 s of recognition. The phone waits for the
+ * whole chain, so it gets our error instead of an aborted fetch.
+ */
+const TRANSCRIBE_TIMEOUT_MS = 43_000
+/**
+ * A voice note spends up to 8 s in ffmpeg and up to 12 s in Telegram
+ * (`VOICE_BUDGET_MS`): the phone must outwait both, or it reports a network
+ * error for a message that is still on its way.
+ */
+const VOICE_TIMEOUT_MS = 21_000
+/**
  * A request came back 401: the token is dead or the Telegram session is gone.
  * The app listens for this and drops the "connected" flag; the client cannot
  * touch React state.
@@ -70,6 +93,7 @@ const ERROR_CODES: readonly AuthErrorCode[] = [
   'linkExpired',
   'llm',
   'send',
+  'stt',
   'unknown',
 ]
 
@@ -112,39 +136,49 @@ async function request<T>(
   const auth = token()
   if (auth) headers.set('Authorization', `Bearer ${auth}`)
 
-  let response: Response
+  let status = 0
+  let ok = false
+  let body: unknown = null
   try {
-    response = await fetch(`${base}${path}`, {
-      ...init,
-      headers,
-      signal: controller.signal,
-      credentials: 'omit',
-    })
-  } catch {
-    throw new AuthError('network')
+    let response: Response
+    try {
+      response = await fetch(`${base}${path}`, {
+        ...init,
+        headers,
+        signal: controller.signal,
+        credentials: 'omit',
+      })
+    } catch {
+      throw new AuthError('network')
+    }
+
+    status = response.status
+    ok = response.ok
+    if (status === 401) {
+      clearToken()
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+    }
+
+    // The body is part of the answer: a server that sends headers and then
+    // stalls must hit the same deadline, otherwise SENDING and HEARD hang
+    // forever and both background-transcript slots stay taken.
+    try {
+      body = await response.json()
+    } catch {
+      body = null
+    }
+    if (body === null && controller.signal.aborted) throw new AuthError('network')
   } finally {
     window.clearTimeout(timer)
   }
 
-  if (response.status === 401) {
-    clearToken()
-    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
-  }
-
-  let body: unknown = null
-  try {
-    body = await response.json()
-  } catch {
-    body = null
-  }
-
-  if (!response.ok) {
+  if (!ok) {
     const raw =
       body && typeof body === 'object' && 'error' in body
         ? (body as { error?: unknown }).error
         : undefined
     const code = ERROR_CODES.find((c) => c === raw) ?? 'unknown'
-    throw new AuthError(code, undefined, response.status)
+    throw new AuthError(code, undefined, status)
   }
 
   return body as T
@@ -297,6 +331,9 @@ export function createRealApi(base: string): Api {
             text: typeof r.text === 'string' ? r.text : '',
             out: r.out === true,
             ...(r.media === true ? { media: true } : {}),
+            // Without this flag the page never asks for the transcript and the
+            // voice note stays the word "Voice message" (v0.7 §8).
+            ...(r.voice === true ? { voice: true } : {}),
           },
         ]
       })
@@ -309,9 +346,44 @@ export function createRealApi(base: string): Api {
         { method: 'POST', body: JSON.stringify({ messageId, text }) },
         SEND_TIMEOUT_MS,
       )
+      return asSent(body, 'send')
+    },
+
+    async transcribe(audio: string, format: AudioFormat): Promise<Transcript> {
+      const body = await request<unknown>(
+        base,
+        '/stt',
+        { method: 'POST', body: JSON.stringify({ audio, format }) },
+        STT_TIMEOUT_MS,
+      )
       const raw = body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
-      if (typeof raw.id !== 'string' || typeof raw.at !== 'string') throw new AuthError('send')
-      return { id: raw.id, at: raw.at }
+      if (typeof raw.text !== 'string') throw new AuthError('stt')
+      return {
+        text: raw.text,
+        durationMs: typeof raw.durationMs === 'number' ? raw.durationMs : 0,
+      }
+    },
+
+    async sendVoice(chatId: string, messageId: string, audio: string) {
+      const body = await request<unknown>(
+        base,
+        `/chats/${encodeURIComponent(chatId)}/voice`,
+        { method: 'POST', body: JSON.stringify({ messageId, audio }) },
+        VOICE_TIMEOUT_MS,
+      )
+      return asSent(body, 'send')
+    },
+
+    async transcribeMessage(chatId: string, messageId: string) {
+      const body = await request<unknown>(
+        base,
+        `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/transcribe`,
+        { method: 'POST' },
+        TRANSCRIBE_TIMEOUT_MS,
+      )
+      const raw = body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
+      if (typeof raw.text !== 'string' || raw.text.length === 0) throw new AuthError('stt')
+      return { text: raw.text }
     },
 
     async markRead(chatId: string, messageId: string) {
@@ -359,6 +431,16 @@ export function createRealApi(base: string): Api {
       return { models, current: typeof raw.current === 'string' ? raw.current : '' }
     },
   }
+}
+
+/**
+ * `{ id, at }` from a send (text or voice). A body without both fields is a
+ * failed send: the glasses must not show a receipt that does not exist.
+ */
+function asSent(body: unknown, code: AuthErrorCode): { id: string; at: string } {
+  const raw = body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
+  if (typeof raw.id !== 'string' || typeof raw.at !== 'string') throw new AuthError(code)
+  return { id: raw.id, at: raw.at }
 }
 
 /**

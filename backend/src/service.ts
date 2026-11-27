@@ -13,6 +13,21 @@ import type {
   SettingsPayload,
 } from './contract.js'
 
+/** A downloaded voice message: the container as Telegram stores it. */
+export interface VoiceAudio {
+  audio: Buffer
+  mime: string
+  /** Telegram's own duration, seconds. */
+  durationSec: number
+}
+
+/** A ready Ogg Opus file on disk; the caller removes the temp directory. */
+export interface VoiceFile {
+  path: string
+  size: number
+  durationSec: number
+}
+
 export interface AuthService {
   /** Drops pending logins left by a previous process; called once at startup. */
   boot(): void
@@ -74,6 +89,30 @@ export interface AuthService {
 
   /** Marks the whole dialog read; the QUICK REPLY draft answers the chat. */
   markChatRead(token: string | null, chatId: string): Promise<void>
+
+  /**
+   * The stored session behind a bearer token, or null. The STT service uses it
+   * to refuse `/stt` before any audio reaches whisper.
+   */
+  sessionId(token: string | null): string | null
+
+  /**
+   * Bytes of a voice message of this dialog. `404` for an id this chat does not
+   * have, `400` for a message that is not a voice note.
+   */
+  voiceMessageOf(token: string | null, chatId: string, messageId: string): Promise<VoiceAudio>
+
+  /**
+   * Sends an Ogg Opus file as a voice note. `random_id` comes from the same
+   * `chatId + messageId` pair, in its own namespace: a retry is not a second
+   * message, and the note is not swallowed by the text sent from the same pair.
+   */
+  sendVoiceFile(
+    token: string | null,
+    chatId: string,
+    messageId: string,
+    file: VoiceFile,
+  ): Promise<{ id: string; at: string }>
 
   putSettings(token: string | null, payload: SettingsPayload): Promise<void>
   setLlmKey(token: string | null, apiKey: string): Promise<void>

@@ -106,6 +106,15 @@ CREATE TABLE IF NOT EXISTS llm_cache (
   replies TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS stt_cache (
+  chat_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  seconds INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, message_id)
+);
 `
 
 export class Db {
@@ -146,6 +155,7 @@ export class Db {
         // Replacing the account must not leave another login's message text in
         // the LLM cache; `deleteSession` makes the same promise.
         this.db.exec('DELETE FROM llm_cache')
+        this.db.exec('DELETE FROM stt_cache')
       }
       this.db
         .prepare(
@@ -183,6 +193,7 @@ export class Db {
       // The cache holds message-derived text; it must not outlive the account
       // and be served to a different login.
       this.db.exec('DELETE FROM llm_cache')
+      this.db.exec('DELETE FROM stt_cache')
     })
   }
 
@@ -343,6 +354,39 @@ export class Db {
     this.db.prepare('DELETE FROM llm_cache WHERE created_at < ?').run(before)
   }
 
+  // ---- speech-to-text cache ----------------------------------------------
+
+  /**
+   * One voice message is recognized once: `chatId + messageId` identifies the
+   * recording, and the transcript does not change under it. There is no TTL —
+   * a recording is immutable, and the rows die with the account.
+   */
+  getSttCache(chatId: string, messageId: string): { text: string; seconds: number } | null {
+    const row = this.db
+      .prepare('SELECT text, seconds FROM stt_cache WHERE chat_id = ? AND message_id = ?')
+      .get(chatId, messageId) as unknown as { text: string; seconds: number } | undefined
+    return row ?? null
+  }
+
+  putSttCache(
+    chatId: string,
+    messageId: string,
+    text: string,
+    seconds: number,
+    now: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO stt_cache (chat_id, message_id, text, seconds, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(chat_id, message_id) DO UPDATE SET
+           text = excluded.text,
+           seconds = excluded.seconds,
+           created_at = excluded.created_at`,
+      )
+      .run(chatId, messageId, text, Math.max(0, Math.round(seconds)), now)
+  }
+
   // ---- future auth tokens ------------------------------------------------
 
   addFutureToken(token: string, sessionId: string, now: number): void {
@@ -376,6 +420,7 @@ export class Db {
       this.db.exec('DELETE FROM settings')
       this.db.exec('DELETE FROM llm_key')
       this.db.exec('DELETE FROM llm_cache')
+      this.db.exec('DELETE FROM stt_cache')
       this.db.exec('DELETE FROM future_token')
       this.db.exec('DELETE FROM pending')
       this.db.exec('DELETE FROM session')

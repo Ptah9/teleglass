@@ -1,6 +1,10 @@
 /**
  * node:http adapter around `handle`. Small on purpose: one request in, one JSON
  * answer out, body capped so a stray upload cannot grow memory.
+ *
+ * 8 MB is the audio ceiling: one 120 s PCM recording is 3.84 MB raw, 5.1 MB in
+ * base64, plus the JSON envelope. Text routes stay far below it — the cap is
+ * about a runaway body, not about trusting the phone.
  */
 
 import {
@@ -12,7 +16,7 @@ import {
 } from 'node:http'
 import { handle, type HandlerDeps, type OutgoingResponse } from './handler.js'
 
-export const MAX_BODY_BYTES = 16 * 1024
+export const MAX_BODY_BYTES = 8 * 1024 * 1024
 
 export function createHttpServer(deps: HandlerDeps): Server {
   return createServer((request, response) => {

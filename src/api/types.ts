@@ -25,6 +25,7 @@ export type AuthErrorCode =
   | 'linkExpired'
   | 'llm'
   | 'send'
+  | 'stt'
   | 'unknown'
 
 /** An error the WebView can name on the screen, not a stack trace. */
@@ -71,6 +72,16 @@ export interface MessageSummary {
   out: boolean
   /** `text` is a media word, not the author's letters (the LLM language rule). */
   media?: boolean
+  /** The media is a voice note: the page asks for a transcript (v0.7). */
+  voice?: boolean
+}
+
+/** What `/stt` accepts: raw glasses PCM or a WAV with a header. */
+export type AudioFormat = 'wav' | 'pcm'
+
+export interface Transcript {
+  text: string
+  durationMs: number
 }
 
 /** What the LLM returns for one message. */
@@ -143,6 +154,25 @@ export interface Api {
    * error (or `network`/`unknown` for auth); the glasses show OFFLINE.
    */
   sendReply(chatId: string, messageId: string, text: string): Promise<{ id: string; at: string }>
+  /**
+   * Recognition of one recording (`audio` is base64 without a data URL, `format`
+   * is `pcm` for the glasses' raw stream or `wav`). An empty result, a timeout or
+   * a dead provider is an honest `stt` error: HEARD says "did not catch it".
+   */
+  transcribe(audio: string, format: AudioFormat): Promise<Transcript>
+  /**
+   * Sends the recording as a Telegram voice note. `random_id` is anchored to the
+   * same `chatId + messageId` pair as text, in its own namespace: a retry cannot
+   * duplicate it, and the text sent from the same pair cannot swallow it (the
+   * backend found that live on 27.11). A refusal is a `send` error and the
+   * glasses show OFFLINE.
+   */
+  sendVoice(chatId: string, messageId: string, audio: string): Promise<{ id: string; at: string }>
+  /**
+   * Transcript of an incoming voice message, cached on the backend by
+   * `chatId + messageId`: opening it again does not recognize it twice.
+   */
+  transcribeMessage(chatId: string, messageId: string): Promise<{ text: string }>
   /** Marks one message (and everything older) read on the server side. */
   markRead(chatId: string, messageId: string): Promise<void>
   /** Marks the whole dialog read — the QUICK REPLY draft answers every unread. */

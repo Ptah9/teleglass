@@ -1,7 +1,7 @@
 {
   "package_id": "com.ptah.teleglass",
   "name": "Teleglass",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "edition": "202601",
   "min_sdk_version": "0.0.16",
   "entrypoint": "index.html",
@@ -9,10 +9,6 @@
     {
       "name": "g2-microphone",
       "desc": "Records a voice reply on the glasses microphone and shows its level while you speak."
-    },
-    {
-      "name": "phone-microphone",
-      "desc": "Records a voice reply on the phone microphone instead of the glasses one, if you switch the source."
     }
   ],
   "supported_languages": [

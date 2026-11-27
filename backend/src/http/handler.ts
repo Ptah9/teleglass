@@ -17,10 +17,14 @@ import type { Logger } from '../log.js'
 import { errorTag } from '../log.js'
 import type { LlmApi } from '../llm/service.js'
 import type { AuthService } from '../service.js'
+import type { SttApi } from '../stt/service.js'
+import type { VoiceApi } from '../voice/service.js'
 
 export interface HandlerDeps {
   auth: AuthService
   llm: LlmApi
+  stt: SttApi
+  voice: VoiceApi
   log: Logger
   corsOrigins: string[]
 }
@@ -103,6 +107,13 @@ async function dispatch(
         const text = requireText(body, 'text')
         return json(200, await deps.auth.sendReply(token, action.chatId, messageId, text))
       }
+      if (action.action === 'voice') {
+        const body = parseJson(request.body)
+        const messageId = requireString(body, 'messageId')
+        if (messageId.length > 32) throw new ContractError('unknown', 404)
+        const audio = requireLongString(body, 'audio')
+        return json(200, await deps.voice.send(token, action.chatId, messageId, audio))
+      }
       const body = parseJson(request.body)
       if ('messageId' in body) {
         // A present but non-string id is a client bug, not "the whole chat".
@@ -111,6 +122,15 @@ async function dispatch(
         await deps.auth.markChatRead(token, action.chatId)
       }
       return noContent()
+    }
+
+    const transcript = transcribePath(path)
+    if (transcript !== null) {
+      if (!token) throw new ContractError('unknown', 401)
+      return json(
+        200,
+        await deps.stt.transcribeMessage(token, transcript.chatId, transcript.messageId),
+      )
     }
   }
 
@@ -173,6 +193,14 @@ async function dispatch(
       const apiKey = requireString(body, 'apiKey')
       await deps.auth.setLlmKey(token, apiKey)
       return json(200, { ok: true })
+    }
+
+    case 'POST /stt': {
+      if (!token) throw new ContractError('unknown', 401)
+      const body = parseJson(request.body)
+      const audio = requireLongString(body, 'audio')
+      const format = requireString(body, 'format')
+      return json(200, await deps.stt.transcribe(token, audio, format))
     }
 
     case 'GET /llm/models':
@@ -244,16 +272,34 @@ function messagesPath(path: string): string | null {
 }
 
 /**
- * `/chats/<id>/send` and `/chats/<id>/read` — the two POST routes that carry a
- * chat id. Percent-encoded for the same reason as `messagesPath`.
+ * `/chats/<id>/send`, `/read` and `/voice` — the POST routes that carry a chat
+ * id. Percent-encoded for the same reason as `messagesPath`.
  */
-function chatActionPath(path: string): { chatId: string; action: 'send' | 'read' } | null {
-  const match = /^\/chats\/([^/]+)\/(send|read)$/.exec(path)
+function chatActionPath(
+  path: string,
+): { chatId: string; action: 'send' | 'read' | 'voice' } | null {
+  const match = /^\/chats\/([^/]+)\/(send|read|voice)$/.exec(path)
   if (!match?.[1] || !match[2]) return null
   try {
     const chatId = decodeURIComponent(match[1])
     if (chatId.length === 0 || chatId.length > 96) return null
-    return { chatId, action: match[2] === 'send' ? 'send' : 'read' }
+    const action = match[2] === 'send' ? 'send' : match[2] === 'voice' ? 'voice' : 'read'
+    return { chatId, action }
+  } catch {
+    return null
+  }
+}
+
+/** `/chats/<id>/messages/<messageId>/transcribe`. */
+function transcribePath(path: string): { chatId: string; messageId: string } | null {
+  const match = /^\/chats\/([^/]+)\/messages\/([^/]+)\/transcribe$/.exec(path)
+  if (!match?.[1] || !match[2]) return null
+  try {
+    const chatId = decodeURIComponent(match[1])
+    const messageId = decodeURIComponent(match[2])
+    if (chatId.length === 0 || chatId.length > 96) return null
+    if (messageId.length === 0 || messageId.length > 32) return null
+    return { chatId, messageId }
   } catch {
     return null
   }
@@ -298,6 +344,20 @@ function requireString(body: Record<string, unknown>, key: string): string {
   const value = body[key]
   if (typeof value !== 'string' || value.length === 0 || value.length > 512) {
     throw new ContractError('unknown')
+  }
+  return value
+}
+
+/**
+ * An audio body is not a setting: the 120 s cap is ~3.8 MB of PCM, ~5.1 MB of
+ * base64. The HTTP server caps the whole request above that.
+ */
+const MAX_AUDIO_FIELD = 5_300_000
+
+function requireLongString(body: Record<string, unknown>, key: string): string {
+  const value = body[key]
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_AUDIO_FIELD) {
+    throw new ContractError('unknown', 400)
   }
   return value
 }

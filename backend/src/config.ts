@@ -40,6 +40,10 @@ export interface Config {
   llmModel: string | null
   /** Models offered to T3, in `.env` order. */
   llmModels: string[]
+  /** Local whisper.cpp server; audio never leaves the machine. */
+  whisperUrl: string
+  /** `ggml-small.bin`; missing model is `502 stt`, not a crash. */
+  whisperModel: string
 }
 
 export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -90,6 +94,15 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const llmModel = emptyToNull(env.LLM_MODEL) ?? llmModels[0] ?? null
   if (llmModel && !llmModels.includes(llmModel)) llmModels.unshift(llmModel)
 
+  const whisperUrl = (emptyToNull(env.WHISPER_URL) ?? 'http://127.0.0.1:8081').replace(/\/+$/, '')
+  if (!/^https?:\/\//i.test(whisperUrl)) {
+    throw new Error('WHISPER_URL must start with http:// or https://')
+  }
+  const whisperModel = resolve(
+    backendRoot,
+    (emptyToNull(env.WHISPER_MODEL) ?? './vendor/whisper/ggml-small.bin').trim(),
+  )
+
   return {
     apiId,
     apiHash,
@@ -105,6 +118,8 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): Config {
     llmApiKey: emptyToNull(env.LLM_API_KEY),
     llmModel,
     llmModels,
+    whisperUrl,
+    whisperModel,
   }
 }
 

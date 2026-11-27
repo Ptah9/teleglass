@@ -10,3 +10,7 @@ BUGS.md
 HANDOFF.md
 REVIEW.md
 backend/data/
+
+# Речь: бинарники whisper.cpp и модели (~1 ГБ). В публичный репозиторий не едут,
+# в README — как поставить.
+backend/vendor/

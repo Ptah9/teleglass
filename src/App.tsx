@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
+import { toBase64 } from './api/audio'
 import { HEALTH_EVENT, UNAUTHORIZED_EVENT } from './api/client'
 import { hasDemoFlag } from './api/demo-flags'
 import { AuthError } from './api/types'
@@ -213,6 +214,81 @@ export default function App() {
         })
     })
     return () => page.onSend(null)
+  }, [page, reloadFeed])
+
+  /**
+   * A recording stopped: the WebView recognizes it on our backend (whisper), and
+   * the page shows the text on HEARD. A refusal is passed as `ok: false` — the
+   * screen says "did not catch it", never an empty transcript.
+   */
+  useEffect(() => {
+    if (!page) return
+    page.onTranscript((chatId, attempt, pcm) => {
+      api
+        .transcribe(toBase64(pcm), 'pcm')
+        .then((result) => page.applyTranscript(chatId, attempt, { ok: true, text: result.text }))
+        .catch((err: unknown) => {
+          // The voice itself is never logged; only the fact of a failure.
+          console.warn('[teleglass] the recording was not recognized:', err)
+          page.applyTranscript(chatId, attempt, { ok: false, text: '' })
+        })
+    })
+    return () => page.onTranscript(null)
+  }, [page])
+
+  /**
+   * An incoming voice message is shown as text: the backend downloads it,
+   * converts it and caches the transcript by chat + message, so opening it
+   * again costs no recognition.
+   */
+  useEffect(() => {
+    if (!page) return
+    page.onIncomingTranscript((chatId, messageId) => {
+      api
+        .transcribeMessage(chatId, messageId)
+        .then((result) => page.applyIncomingTranscript(chatId, messageId, { ok: true, text: result.text }))
+        .catch((err: unknown) => {
+          console.warn('[teleglass] the voice message was not transcribed:', err)
+          page.applyIncomingTranscript(chatId, messageId, { ok: false, text: '' })
+        })
+    })
+    return () => page.onIncomingTranscript(null)
+  }, [page])
+
+  /**
+   * HEARD → swipe ↑ sends the same recording as a Telegram voice note. A retry
+   * from OFFLINE reuses the same `chatId + messageId` anchor, so `random_id`
+   * cannot produce a second note.
+   */
+  useEffect(() => {
+    if (!page) return
+    page.onSendVoice((chatId, messageId, pcm) => {
+      if (!api.demo && pcm.byteLength === 0) {
+        // Nothing was recorded (capture refused): a retry cannot help.
+        page.applySend({ chatId, messageId, ok: false, gone: true })
+        return
+      }
+      api
+        .sendVoice(chatId, messageId, toBase64(pcm))
+        .then((sent) => {
+          page.applySend({ chatId, messageId, ok: true, at: sent.at })
+          // Same rule as a text reply: the answered message becomes read.
+          api
+            .markRead(chatId, messageId)
+            .then(undefined, (err: unknown) => {
+              console.warn('[teleglass] the read mark was not saved:', err)
+              page.applyUnread(chatId, messageId)
+            })
+            .finally(() => void reloadFeed())
+        })
+        .catch((err: unknown) => {
+          console.warn('[teleglass] the voice message was not sent:', err)
+          const gone = err instanceof AuthError && (err.status === 400 || err.status === 404)
+          page.applySend({ chatId, messageId, ok: false, gone })
+          if (gone) void reloadFeed()
+        })
+    })
+    return () => page.onSendVoice(null)
   }, [page, reloadFeed])
 
   /**

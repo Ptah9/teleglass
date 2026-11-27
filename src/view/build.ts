@@ -7,6 +7,17 @@ import { stamp } from './stamp'
 import { BORDER, LIST_ROWS, LIST_ROW, LVL, SLOT } from './geometry'
 
 /**
+ * A header is one 536 px line: the name gets what the fixed tail (counter,
+ * voice badge) leaves. Cutting by characters overflows with wide letters —
+ * the firmware wraps the line and draws a false scrollbar (design-system.md §1).
+ */
+function fitHeader(name: string, tail: string): string {
+  const room = Math.max(1, SLOT.title.w - textWidth(tail))
+  const cut = cutToPx(name, room)
+  return cut.length === 0 ? tail.replace(/^ · /, '') : `${cut}${tail}`
+}
+
+/**
  * Pure screen assembly: (state, dictionary) → set of containers.
  * No SDK and no events — this module can be called from tests and from the
  * browser preview alike.
@@ -272,10 +283,14 @@ function chatView(s: AppState, t: TFunc): View {
   if (!msg) return chatEmptyView(s, t, scr.chatId)
 
   // The counter is in the header, not the footer: the footer is taken by gestures (ux-flow § Жесты).
-  const header = `${cutChars(chatLabel(chat).toUpperCase(), 30)} · ${t('page.counter', {
+  // A voice note's body is a transcript, not the author's letters: the header
+  // says so before the text (owner's call, 27.11) — the sub line holds the time.
+  const voice = msg.voice ? ` · ${t('chat.voiceBadge')}` : ''
+  const tail = ` · ${t('page.counter', {
     page: scr.msgIndex + 1,
     total: msgs.length,
-  })}`
+  })}${voice}`
+  const header = fitHeader(chatLabel(chat).toUpperCase(), tail)
 
   // One gesture, two meanings: long message → full text, short one → skip.
   // "Long" is the measured pixel height, not whether a summary happens to exist:
@@ -338,14 +353,19 @@ function fulltextView(s: AppState, t: TFunc): View {
   // phone, and the sub line says so instead of silently cutting the text.
   const body = cutToChars(msg.text, FULLTEXT_MAX_CHARS)
 
+  // The header is "{chat} · {time}": the name keeps what the badge and the time
+  // leave, cut by pixels so a wide name cannot wrap the line.
+  const badge = msg.voice ? ` · ${t('chat.voiceBadge')}` : ''
+  const time = stamp(msg.at, s.lang)
+  const room = Math.max(1, SLOT.title.w - textWidth(`${badge} · ${time}`))
+  const cut = cutToPx(chatLabel(chat).toUpperCase(), room)
+  const label = cut.length === 0 ? badge.replace(/^ · /, '') : `${cut}${badge}`
+
   const texts = textsOf([
     {
       id: 'title',
       slot: 'title',
-      content: t('fulltext.title', {
-        chat: cutChars(chatLabel(chat).toUpperCase(), 24),
-        time: stamp(msg.at, s.lang),
-      }),
+      content: t('fulltext.title', { chat: label, time }),
       level: LVL.main,
     },
     dividerSpec('divider'),
@@ -372,8 +392,10 @@ function repliesView(s: AppState, t: TFunc): View {
   const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
   if (!msg || msg.replies.length === 0) return repliesEmptyView(s, t)
 
-  // "Say it" is the mandatory second way into voice (design-system.md §5.1):
-  // the OS may take the long press for its own menu, the tap always remains.
+  // Three fixed rows after the LLM options: dictate a text reply, record a voice
+  // note, mark the message read. The first one is the mandatory second way into
+  // voice (design-system.md §5.1): the OS may take the long press for its own
+  // menu, the tap always remains.
   const items = [
     ...msg.replies.map((reply) =>
       cutBytes(
@@ -381,7 +403,9 @@ function repliesView(s: AppState, t: TFunc): View {
         LIST_ITEM_BYTES,
       ),
     ),
-    cutBytes(t('options.sayIt'), LIST_ITEM_BYTES),
+    cutBytes(t('options.sayText'), LIST_ITEM_BYTES),
+    cutBytes(t('options.sayVoice'), LIST_ITEM_BYTES),
+    cutBytes(t('options.justRead'), LIST_ITEM_BYTES),
   ]
 
   const texts = textsOf([
@@ -393,8 +417,9 @@ function repliesView(s: AppState, t: TFunc): View {
     id: 'list',
     ...listRect(items.length),
     items,
-    // The selection is clamped to the visible window: the highlight must not leave the list.
-    sel: Math.min(Math.max(scr.sel, 0), Math.min(items.length, LIST_ROWS) - 1),
+    // All rows are reachable: the native list scrolls its 4-row window, as in
+    // CHATS. Clamping to LIST_ROWS would make the last two rows untappable.
+    sel: Math.min(Math.max(scr.sel, 0), items.length - 1),
   }
   return { shape: shapeOf(texts, list), texts, list }
 }
@@ -430,7 +455,9 @@ function repliesEmptyView(s: AppState, t: TFunc): View {
     {
       id: 'footer',
       slot: 'footer',
-      content: s.llmConfigured ? t('replies.emptyHint') : '',
+      // Without a model "retry" cannot succeed, but saying it still can: the
+      // footer offers only the gesture that works.
+      content: s.llmConfigured ? t('replies.emptyHint') : t('replies.sayItHint'),
       level: LVL.caption,
     },
   ])
@@ -499,16 +526,23 @@ function skipConfirmView(s: AppState, t: TFunc): View {
 function sendingView(s: AppState, t: TFunc): View {
   const scr = s.screen
   if (scr.kind !== 'sending') return chatsView(s, t)
+  const voice = scr.mode === 'voice'
   const isQuick = scr.mode === 'quick'
   const texts = textsOf([
     {
       id: 'title',
       slot: 'title',
-      content: isQuick ? t('quickReply.title') : t('confirm.title'),
+      content: voice ? t('voice.sending.title') : isQuick ? t('quickReply.title') : t('confirm.title'),
       level: LVL.main,
     },
     dividerSpec('divider'),
-    { id: 'body', slot: 'body', content: `"${scr.reply}"`, level: LVL.body, capture: true },
+    {
+      id: 'body',
+      slot: 'body',
+      content: voice ? t('voice.body') : `"${scr.reply}"`,
+      level: LVL.body,
+      capture: true,
+    },
     // Footer without actions — "waiting, no gestures" (ux-flow, SENDING).
     { id: 'sub', slot: 'sub', content: t('chats.sending'), level: LVL.caption },
     { id: 'footer', slot: 'footer', content: '', level: LVL.caption },
@@ -525,19 +559,31 @@ function sentView(s: AppState, t: TFunc): View {
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('sent.title'), level: LVL.main },
     dividerSpec('divider'),
-    { id: 'body', slot: 'body', content: `"${scr.reply}"`, level: LVL.body, capture: true },
+    {
+      id: 'body',
+      slot: 'body',
+      content: scr.voice ? t('voice.body') : `"${scr.reply}"`,
+      level: LVL.body,
+      capture: true,
+    },
     { id: 'sub', slot: 'sub', content: stamp, level: LVL.caption },
     { id: 'footer', slot: 'footer', content: t('sent.hint'), level: LVL.caption },
   ])
   return { shape: shapeOf(texts), texts }
 }
 
-function offlineView(_s: AppState, t: TFunc): View {
+function offlineView(s: AppState, t: TFunc): View {
+  const voice = s.screen.kind === 'offline' && s.screen.mode === 'voice'
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('error.title'), level: LVL.main },
     dividerSpec('divider'),
     { id: 'body', slot: 'body', content: t('error.body'), level: LVL.body, capture: true },
-    { id: 'sub', slot: 'sub', content: t('error.sub'), level: LVL.caption },
+    {
+      id: 'sub',
+      slot: 'sub',
+      content: voice ? t('voice.notSent') : t('error.sub'),
+      level: LVL.caption,
+    },
     { id: 'footer', slot: 'footer', content: t('error.hint'), level: LVL.caption },
   ])
   return { shape: shapeOf(texts), texts }
@@ -548,16 +594,13 @@ function offlineView(_s: AppState, t: TFunc): View {
 // ---------------------------------------------------------------------------
 
 /**
- * LISTENING footer. Two things change it: how the recording was started (the
- * hold has no fingers left for a swipe) and which microphone is live. With the
- * phone microphone the caption has to say so (design-system.md §5.1) — and the
- * combined line does not fit 536 px on the hold screen in Russian, so the
- * cancel hint goes: while holding, a swipe is out of reach anyway.
+ * LISTENING footer. How the recording was started decides the second action:
+ * the hold has no fingers left for a swipe, so the cancel hint goes there.
  */
 function listeningHint(scr: Extract<Screen, { kind: 'listening' }>, t: TFunc): string {
-  if (scr.source === 'phone') {
-    return scr.mode === 'hold' ? t('voice.listening.hintPhone') : t('voice.listening.hintTapPhone')
-  }
+  // The mic is closed and whisper works: the footer is the only place that can
+  // say so, and a blank screen while waiting is forbidden (task v0.7 §6).
+  if (scr.phase === 'recognizing') return t('voice.listening.recognizing')
   return scr.mode === 'hold' ? t('voice.listening.hint') : t('voice.listening.hintTap')
 }
 
@@ -604,18 +647,13 @@ function heardView(s: AppState, t: TFunc): View {
   // so the firmware scrolls overflowing text itself and draws its own scrollbar.
   // Our own rail/slider is not needed (and would duplicate the stock one).
   // The footer says "scroll" only when there is something to scroll: on a text
-  // that fits, a scroll hint would promise a gesture that does nothing.
+  // that fits, swipe ↑ sends the recording as a voice note (task v0.7 §7).
   const scrolls = lineCount(scr.text) > BODY_LINES
   const texts = textsOf([
     { id: 'title', slot: 'title', content: t('voice.heard.title'), level: LVL.main },
     dividerSpec('divider'),
     { id: 'body', slot: 'body', content: scr.text, level: LVL.body, capture: true },
-    {
-      id: 'sub',
-      slot: 'sub',
-      content: scr.variant === 'phoneMic' ? t('voice.heard.phoneMic') : '',
-      level: LVL.caption,
-    },
+    { id: 'sub', slot: 'sub', content: '', level: LVL.caption },
     {
       id: 'footer',
       slot: 'footer',

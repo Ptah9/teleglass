@@ -32,18 +32,34 @@ export const CHATS_MAX = 20
 export const WAVE_LEN = 26
 
 /**
- * How long the glasses microphone may stay silent before the page switches to
- * the phone one (design-system.md §5.1: «если за 2 секунды данных нет»).
+ * How long the glasses microphone may stay silent before the recording stops
+ * (task v0.7 §6: «тишина 2 с»). The recording is of a spoken reply, and a pause
+ * longer than this means the thought is over; the finger may still be down.
  */
-export const MIC_FALLBACK_MS = 2000
+export const SILENCE_MS = 2000
 
 /**
- * Hard cap on one recording. The hold is a pair of events (press, release) and
- * the OS may swallow the release (ux-flow.md § Что может не сойтись); without a
- * cap the microphone would stay open until the next swipe. One minute is longer
- * than any reply dictated on the glasses.
+ * Level (0…1 on the indicator's dBFS scale) below which a chunk counts as
+ * silence for `SILENCE_MS`. 0.12 ≈ −53 dBFS: a quiet room stays below it and
+ * normal speech is above; a whisper may not be, so this is tuned on hardware.
  */
-export const MAX_RECORD_MS = 60_000
+export const SILENCE_LEVEL = 0.12
+
+/**
+ * Hard cap on a dictated answer. The hold is a pair of events (press, release)
+ * and the OS may swallow the release (ux-flow.md § Что может не сойтись);
+ * without a cap the microphone would stay open until the next swipe. 45 s keeps
+ * the worst case inside the recognition budget (owner's call, 27.11: 12.8 s of
+ * speech took 6.3 s under load, 45 s fits in 25 s).
+ */
+export const MAX_RECORD_MS = 45_000
+
+/**
+ * A voice note is sent as recorded, with no recognition, so it follows
+ * Telegram's own minute-plus limit instead of the dictation cap (owner's call,
+ * 27.11).
+ */
+export const MAX_VOICE_RECORD_MS = 120_000
 
 /**
  * How long the CHATS footer keeps «not sent». Long enough to be read and to
@@ -51,3 +67,11 @@ export const MAX_RECORD_MS = 60_000
  * the hold-for-retry line stayed on the list forever.
  */
 export const NOT_SENT_MS = 15_000
+
+/**
+ * Incoming voice notes are transcribed in the background, three at a time: the
+ * whisper server keeps one model in memory on one machine, and a burst of
+ * notes would otherwise queue for a minute. The text must be on CHAT when the
+ * message is opened, not after a tap (owner's call, 27.11).
+ */
+export const TRANSCRIPTS_AT_ONCE = 3

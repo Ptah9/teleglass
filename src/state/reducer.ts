@@ -1,14 +1,7 @@
-import {
-  MOCK_CHATS,
-  MOCK_HEARD_LONG,
-  MOCK_HEARD_TEXT,
-  MOCK_INBOX,
-  MOCK_QUICK_REPLY,
-} from './data'
+import { MOCK_CHATS, MOCK_INBOX, MOCK_QUICK_REPLY } from './data'
 import type {
   AppEvent,
   AppState,
-  AudioSource,
   FeedStatus,
   Gesture,
   MockChat,
@@ -38,13 +31,8 @@ const CHATS_MAX = LINES.CHATS_MAX
 const WAVE_LEN = LINES.WAVE_LEN
 /** The demo lever "backend not responding" fails SENDING after this delay. */
 const SEND_MS = 1500
-/** A recording shorter than 0.8 s counts as failed (demo rule for HEARD "did not catch it"). */
+/** A recording shorter than 0.8 s counts as failed (HEARD "did not catch it"). */
 const MIN_RECORD_MS = 800
-/**
- * Demo rule for the scroll: a hold longer than 4 s returns a long transcript,
- * so the scrolling HEARD screen is reachable without real STT.
- */
-const LONG_RECORD_MS = 4000
 
 export function initialState(): AppState {
   return {
@@ -57,7 +45,6 @@ export function initialState(): AppState {
     quickReplyText: MOCK_QUICK_REPLY,
     selectedChats: null,
     backendDown: false,
-    phoneMic: false,
     telegramConnected: true,
     phoneRead: null,
     llmConfigured: false,
@@ -219,8 +206,6 @@ export function reduce(s: AppState, e: AppEvent): AppState {
       return onMenu(s, e.item)
     case 'audio':
       return onAudio(s, e.level)
-    case 'micSource':
-      return onMicSource(s, e.source)
     case 'foreground':
       // Re-arming the microphone is a page duty (it owns the SDK calls); the
       // logic has nothing to change, the screen stays as it was.
@@ -231,8 +216,14 @@ export function reduce(s: AppState, e: AppEvent): AppState {
       return onLlmReplies(s, e)
     case 'sendResult':
       return onSendResult(s, e)
+    case 'voiceEmpty':
+      return onVoiceEmpty(s)
     case 'unread':
       return unmarkChat(s, e.chatId, e.messageId)
+    case 'heardResult':
+      return onHeardResult(s, e)
+    case 'incomingTranscript':
+      return onIncomingTranscript(s, e)
     case 'tick':
       return onTick(s, e.now)
   }
@@ -367,7 +358,12 @@ function withLlmData(old: MockChat[], fresh: MockChat[]): MockChat[] {
   const byId = new Map<string, MockMessage>()
   for (const chat of old) {
     for (const message of chat.messages) {
-      if (message.summary !== undefined || message.replies.length > 0 || message.repliesReady) {
+      if (
+        message.summary !== undefined ||
+        message.replies.length > 0 ||
+        message.repliesReady ||
+        message.transcript === 'done'
+      ) {
         byId.set(message.id, message)
       }
     }
@@ -378,8 +374,13 @@ function withLlmData(old: MockChat[], fresh: MockChat[]): MockChat[] {
     messages: chat.messages.map((message) => {
       const known = byId.get(message.id)
       if (!known) return message
+      // A transcript that was already paid for survives a feed refresh: the
+      // fresh row still says "Voice message", but the text is ours.
+      const transcribed = known.transcript === 'done'
       return {
         ...message,
+        ...(transcribed ? { text: known.text } : {}),
+        ...(transcribed ? { transcript: 'done' as const } : {}),
         ...(known.summary === undefined ? {} : { summary: known.summary }),
         replies: known.replies,
         ...(known.repliesReady ? { repliesReady: true } : {}),
@@ -640,6 +641,62 @@ function beginReplies(s: AppState, chatId: string, msgIndex: number): AppState {
   return { ...s, screen: { kind: 'repliesLoading', chatId, msgIndex } }
 }
 
+/**
+ * Start a recording from the given message. Both entry points (an option row on
+ * REPLIES and the swipe on the empty REPLIES) produce the same screen: the
+ * outcome decides whether the recording is recognized or sent as a note.
+ */
+function listeningAt(
+  s: AppState,
+  chatId: string,
+  msgIndex: number,
+  outcome: 'text' | 'voice',
+): AppState {
+  return {
+    ...s,
+    screen: {
+      kind: 'listening',
+      chatId,
+      msgIndex,
+      mode: 'tap',
+      outcome,
+      startAt: Date.now(),
+      levels: [],
+    },
+  }
+}
+
+/**
+ * What one row of REPLIES does. After the LLM options come exactly three rows,
+ * in this order: dictate a text reply, record a voice note, mark the message
+ * read. One source for the view builder, the reducer and the page's read mark.
+ */
+export type ReplyAction =
+  | { kind: 'option'; reply: string }
+  | { kind: 'sayText' }
+  | { kind: 'sayVoice' }
+  | { kind: 'read' }
+
+export function replyItemCount(message: MockMessage): number {
+  return message.replies.length + 3
+}
+
+export function replyActionOf(message: MockMessage, index: number): ReplyAction | null {
+  if (index >= 0 && index < message.replies.length) {
+    return { kind: 'option', reply: message.replies[index] }
+  }
+  switch (index - message.replies.length) {
+    case 0:
+      return { kind: 'sayText' }
+    case 1:
+      return { kind: 'sayVoice' }
+    case 2:
+      return { kind: 'read' }
+    default:
+      return null
+  }
+}
+
 function onReplies(s: AppState, g: Gesture): AppState {
   const scr = s.screen
   if (scr.kind !== 'replies') return s
@@ -653,7 +710,7 @@ function onReplies(s: AppState, g: Gesture): AppState {
       // Back to CHAT, still unread (ux-flow).
       return { ...s, screen: { kind: 'chat', chatId: scr.chatId, msgIndex: scr.msgIndex } }
     case 'longPress':
-      // Holding the temple arm starts a voice recording (design-system.md §5.1).
+      // Holding the temple arm starts a dictated reply (design-system.md §5.1).
       return {
         ...s,
         screen: {
@@ -661,7 +718,7 @@ function onReplies(s: AppState, g: Gesture): AppState {
           chatId: scr.chatId,
           msgIndex: scr.msgIndex,
           mode: 'hold',
-          source: s.phoneMic ? 'phone' : 'glasses',
+          outcome: 'text',
           startAt: Date.now(),
           levels: [],
         },
@@ -671,7 +728,7 @@ function onReplies(s: AppState, g: Gesture): AppState {
       // Approximate selection sync (as in CHATS).
       const chat = chatById(s, scr.chatId)
       const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
-      const n = (msg?.replies.length ?? 0) + 1
+      const n = msg ? replyItemCount(msg) : 0
       const delta = g === 'swipeUp' ? -1 : 1
       const next = Math.min(Math.max(scr.sel + delta, 0), n - 1)
       return next === scr.sel ? s : { ...s, screen: { ...scr, sel: next } }
@@ -689,7 +746,7 @@ function onRepliesEmpty(s: AppState, g: Gesture): AppState {
       // "tap - retry": the second attempt is an explicit gesture, not a loop.
       return beginReplies(s, scr.chatId, scr.msgIndex)
     case 'longPress':
-      // On "LLM not configured" the footer is empty by design, so a hidden
+      // On "LLM not configured" the footer offers only say it, so a hidden
       // long-press must not open SKIP? for a message the user cannot answer.
       if (!s.llmConfigured) return s
       return {
@@ -701,6 +758,10 @@ function onRepliesEmpty(s: AppState, g: Gesture): AppState {
           from: 'chat',
         },
       }
+    case 'swipeDown':
+      // "say it": voice must not depend on the model. A failed answer still
+      // lets the user dictate; HEARD then offers the note by swipe ↑.
+      return listeningAt(s, scr.chatId, scr.msgIndex, 'text')
     case 'doubleClick':
     case 'swipeUp':
       // Back to the message we came from, not to the first one in the queue.
@@ -793,7 +854,7 @@ function onConfirm(s: AppState, g: Gesture): AppState {
             kind: 'heard',
             chatId: scr.chatId,
             msgIndex: scr.msgIndex,
-            variant: scr.heardVariant ?? 'ok',
+            variant: 'ok',
             text: scr.reply,
           },
         }
@@ -873,7 +934,8 @@ function onOffline(s: AppState, g: Gesture): AppState {
   switch (g) {
     case 'click':
       // Tap — retry (error.hint). The anchor is the one the failed attempt
-      // used: a new one would get a new `random_id`.
+      // used: a new one would get a new `random_id`. A voice note retries the
+      // same recording (the page still holds it), not an empty text.
       return {
         ...s,
         screen: {
@@ -882,7 +944,7 @@ function onOffline(s: AppState, g: Gesture): AppState {
           msgIndex: scr.msgIndex,
           messageId: scr.messageId,
           reply: scr.reply,
-          mode: 'reply',
+          mode: scr.mode,
           startAt: Date.now(),
         },
       }
@@ -897,13 +959,18 @@ function onOffline(s: AppState, g: Gesture): AppState {
 }
 
 // ---------------------------------------------------------------------------
-// Voice: LISTENING and HEARD. There is no recognition in v0.1 — the text comes
-// from mock constants, and the rules below are honestly demo rules, not STT.
+// Voice: LISTENING and HEARD. Recognition is asynchronous (v0.7): a stopped
+// dictation stays on LISTENING with `phase: 'recognizing'` and is resolved by
+// `heardResult`; the recording itself belongs to the page, which is the only
+// layer that sees the microphone.
 // ---------------------------------------------------------------------------
 
 function onListening(s: AppState, g: Gesture): AppState {
   const scr = s.screen
   if (scr.kind !== 'listening') return s
+  // Whisper is working: the footer says "recognizing…" and no gesture does
+  // anything until the text (or its absence) arrives (task v0.7 §6).
+  if (scr.phase === 'recognizing') return s
 
   switch (g) {
     case 'click':
@@ -912,8 +979,15 @@ function onListening(s: AppState, g: Gesture): AppState {
       if (scr.mode === 'tap') return stopListening(s)
       return s
     case 'longPressRelease':
-      // Hold mode: released — stop and "recognize".
+      // Hold mode: released - stop and "recognize".
       if (scr.mode === 'hold') return stopListening(s)
+      return s
+    case 'doubleClick':
+      // Two quick taps still mean "stop": the first tap is swallowed by the
+      // double-tap window, and in the voice mode nothing else ends the
+      // recording (there is no 2 s silence stop there) — ignoring it would
+      // record the room until the 120 s cap.
+      if (scr.mode === 'tap') return stopListening(s)
       return s
     case 'swipeUp':
       // Cancel without recognition — back to the options (ux-flow).
@@ -926,8 +1000,18 @@ function onListening(s: AppState, g: Gesture): AppState {
 function stopListening(s: AppState): AppState {
   const scr = s.screen
   if (scr.kind !== 'listening') return s
+  // Already waiting for whisper: a second stop must not start another attempt.
+  if (scr.phase === 'recognizing') return s
   const dur = Date.now() - scr.startAt
   const base = { chatId: scr.chatId, msgIndex: scr.msgIndex }
+
+  if (scr.outcome === 'voice') {
+    // The recording is the message: no recognition and no HEARD. A tap that
+    // caught almost nothing goes back to the options instead of a sub-second
+    // voice note.
+    if (dur < MIN_RECORD_MS) return toReplies(s, scr.chatId, scr.msgIndex)
+    return toSendingVoice(s, scr.chatId, scr.msgIndex)
+  }
 
   if (dur < MIN_RECORD_MS) {
     return {
@@ -935,17 +1019,11 @@ function stopListening(s: AppState): AppState {
       screen: { kind: 'heard', ...base, variant: 'error', text: '' },
     }
   }
-  // Long hold — long transcript; the text itself is shown in full and scrolls.
-  // The caption follows the microphone that actually recorded, not the lever.
-  return {
-    ...s,
-    screen: {
-      kind: 'heard',
-      ...base,
-      variant: scr.source === 'phone' ? 'phoneMic' : 'ok',
-      text: dur > LONG_RECORD_MS ? MOCK_HEARD_LONG : MOCK_HEARD_TEXT,
-    },
-  }
+  // Recognition is asynchronous: the screen stays LISTENING, the microphone is
+  // closed by the page, and the footer says "recognizing…" instead of showing a
+  // blank HEARD. `startAt` names the attempt, so a late answer cannot overwrite
+  // a newer recording.
+  return { ...s, screen: { ...scr, phase: 'recognizing' } }
 }
 
 function onHeard(s: AppState, g: Gesture): AppState {
@@ -959,13 +1037,20 @@ function onHeard(s: AppState, g: Gesture): AppState {
         return toReplies(s, scr.chatId, scr.msgIndex)
       case 'longPress':
         return startListeningAgain(s, 'hold')
+      case 'swipeUp':
+        // The recording still exists: "did not catch it" does not mean "did not
+        // record it". The same audio goes out as a voice note (task v0.7 §7).
+        return sendVoiceFrom(s, scr)
       default:
         return s
     }
   }
 
   // Recognized text: the firmware scrolls the body natively while it overflows,
-  // so swipes are not our business here. When the text fits, they do nothing.
+  // so a swipe over a long transcript is a scroll and nothing else. On a text
+  // that fits there is nothing to scroll, and swipe ↑ sends the recording as a
+  // voice note — two outcomes of one audio (task v0.7 §7).
+  const scrolls = lineCount(scr.text) > BODY_LINES
   switch (g) {
     case 'click':
       return {
@@ -976,8 +1061,6 @@ function onHeard(s: AppState, g: Gesture): AppState {
           msgIndex: scr.msgIndex,
           reply: scr.text,
           from: 'heard',
-          // Keep the caption: after "no" the transcript returns as it was.
-          heardVariant: scr.variant === 'phoneMic' ? 'phoneMic' : 'ok',
         },
       }
     case 'longPress':
@@ -985,9 +1068,39 @@ function onHeard(s: AppState, g: Gesture): AppState {
     case 'doubleClick':
       // Back to CHAT, still unread (ux-flow: HEARD returns to the message).
       return { ...s, screen: { kind: 'chat', chatId: scr.chatId, msgIndex: scr.msgIndex } }
+    case 'swipeUp':
+      return scrolls ? s : sendVoiceFrom(s, scr)
     default:
       return s
   }
+}
+
+/**
+ * SENDING with the recording the page already holds, no text. The screen names
+ * the attempt so a late answer resolves the same screen it came from.
+ */
+function toSendingVoice(s: AppState, chatId: string, msgIndex: number): AppState {
+  const chat = chatById(s, chatId)
+  const msg = chat ? unreadMsgs(chat, s.read)[msgIndex] : undefined
+  return {
+    ...s,
+    screen: {
+      kind: 'sending',
+      chatId,
+      msgIndex,
+      messageId: anchorId(msg),
+      reply: '',
+      mode: 'voice',
+      startAt: Date.now(),
+    },
+  }
+}
+
+/**
+ * HEARD → SENDING with the recording: the second outcome of one audio (§7).
+ */
+function sendVoiceFrom(s: AppState, scr: Extract<Screen, { kind: 'heard' }>): AppState {
+  return toSendingVoice(s, scr.chatId, scr.msgIndex)
 }
 
 function startListeningAgain(s: AppState, mode: 'hold' | 'tap'): AppState {
@@ -1000,7 +1113,7 @@ function startListeningAgain(s: AppState, mode: 'hold' | 'tap'): AppState {
       chatId: scr.chatId,
       msgIndex: scr.msgIndex,
       mode,
-      source: s.phoneMic ? 'phone' : 'glasses',
+      outcome: 'text',
       startAt: Date.now(),
       levels: [],
     },
@@ -1024,7 +1137,7 @@ function onListSelect(s: AppState, index: number): AppState {
       const scr = s.screen
       const chat = chatById(s, scr.chatId)
       const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
-      const n = (msg?.replies.length ?? 0) + 1
+      const n = msg ? replyItemCount(msg) : 0
       const next = Math.min(index, n - 1)
       return next === scr.sel ? s : { ...s, screen: { ...scr, sel: next } }
     }
@@ -1053,33 +1166,32 @@ function onListClick(s: AppState, index: number): AppState {
       const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
       if (!msg) return s
       const i = index >= 0 ? index : scr.sel
-      // Last item is "Say it": tap starts, tap ends (design-system §5.1).
-      if (i === msg.replies.length) {
+      const action = replyActionOf(msg, i)
+      if (!action) return s
+      if (action.kind === 'option') {
         return {
           ...s,
           screen: {
-            kind: 'listening',
+            kind: 'confirm',
             chatId: scr.chatId,
             msgIndex: scr.msgIndex,
-            mode: 'tap',
-            source: s.phoneMic ? 'phone' : 'glasses',
-            startAt: Date.now(),
-            levels: [],
+            reply: action.reply,
+            from: 'replies',
           },
         }
       }
-      const reply = msg.replies[i]
-      if (reply === undefined) return s
-      return {
-        ...s,
-        screen: {
-          kind: 'confirm',
-          chatId: scr.chatId,
-          msgIndex: scr.msgIndex,
-          reply,
-          from: 'replies',
-        },
+      if (action.kind === 'read') {
+        // "Just read": the same local mark the SKIP? confirmation makes, without
+        // the confirmation screen. The page sends it to Telegram (readHandler).
+        return {
+          ...s,
+          read: markMessageRead(s, scr.chatId, scr.msgIndex),
+          screen: { kind: 'chats' },
+        }
       }
+      // "Say it (text)" / "Say it (voice message)": tap starts, tap ends
+      // (design-system §5.1). The outcome decides what the recording becomes.
+      return listeningAt(s, scr.chatId, scr.msgIndex, action.kind === 'sayVoice' ? 'voice' : 'text')
     }
     default:
       return s
@@ -1096,8 +1208,6 @@ function onMenu(s: AppState, item: number): AppState {
       return { ...s, lang: s.lang === 'en' ? 'ru' : 'en' }
     case 2:
       return { ...s, backendDown: !s.backendDown }
-    case 3:
-      return { ...s, phoneMic: !s.phoneMic }
     case 4: {
       // The backend reporting "not linked" takes the glasses back to CHATS:
       // every inner screen belongs to a conversation that cannot be reached.
@@ -1152,13 +1262,70 @@ function onAudio(s: AppState, level: number): AppState {
 }
 
 /**
- * The page switched the microphone (glasses refused, or 2 s without data).
- * LISTENING shows which source is live, and HEARD keeps that caption.
+ * The recognizer answered. Only the HEARD screen that asked for this very
+ * recording is updated: a late answer for an older attempt is dropped, never
+ * pasted over a newer transcript.
  */
-function onMicSource(s: AppState, source: AudioSource): AppState {
+function onHeardResult(
+  s: AppState,
+  e: Extract<AppEvent, { type: 'heardResult' }>,
+): AppState {
   const scr = s.screen
-  if (scr.kind !== 'listening' || scr.source === source) return s
-  return { ...s, screen: { ...scr, source } }
+  // Whisper answers the recording that is still on LISTENING. `startAt` names
+  // the attempt: a late answer for a cancelled or newer recording is dropped.
+  if (scr.kind !== 'listening' || scr.phase !== 'recognizing') return s
+  if (scr.chatId !== e.chatId || scr.startAt !== e.attempt) return s
+  const base = { chatId: scr.chatId, msgIndex: scr.msgIndex }
+  if (!e.ok || e.text.trim().length === 0) {
+    return { ...s, screen: { kind: 'heard', ...base, variant: 'error', text: '' } }
+  }
+  return { ...s, screen: { kind: 'heard', ...base, variant: 'ok', text: e.text } }
+}
+
+/**
+ * An incoming voice message was transcribed. The text replaces the media word
+ * on the message; a failed attempt leaves it as it is and is not repeated until
+ * the feed is reloaded (otherwise every redraw would hammer the provider).
+ */
+function onIncomingTranscript(
+  s: AppState,
+  e: Extract<AppEvent, { type: 'incomingTranscript' }>,
+): AppState {
+  const key = `${e.chatId}#${e.messageId}`
+  let touched = false
+  const chats = s.chats.map((chat) => {
+    if (chat.id !== e.chatId) return chat
+    return {
+      ...chat,
+      messages: chat.messages.map((message) => {
+        if (message.id !== key) return message
+        touched = true
+        const text = e.ok ? e.text.trim() : ''
+        if (text.length === 0) return { ...message, transcript: 'failed' as const }
+        return { ...message, text, transcript: 'done' as const }
+      }),
+    }
+  })
+  return touched ? { ...s, chats } : s
+}
+
+/**
+ * Nothing was recorded: the microphone answered but delivered no PCM, so the
+ * voice note was never uploaded. Back to the options — CHATS would look like a
+ * sent message, and OFFLINE's retry would upload the same empty file.
+ */
+function onVoiceEmpty(s: AppState): AppState {
+  const scr = s.screen
+  if (scr.kind !== 'sending' || scr.mode !== 'voice') return s
+  const chat = chatById(s, scr.chatId)
+  const index = chat
+    ? unreadMsgs(chat, s.read).findIndex((msg) => anchorId(msg) === scr.messageId)
+    : -1
+  if (!chat || index < 0) {
+    // The anchor is gone too: there is nothing to return to.
+    return { ...s, sendingRow: null, screen: { kind: 'chats' } }
+  }
+  return toReplies({ ...s, sendingRow: null }, scr.chatId, index)
 }
 
 /**
@@ -1188,7 +1355,7 @@ function finishSending(s: AppState, now: number, ok: boolean, at?: string): AppS
   const person = chat?.person ?? ''
 
   if (!ok) {
-    if (scr.mode === 'reply') {
+    if (scr.mode === 'reply' || scr.mode === 'voice') {
       return {
         ...s,
         screen: {
@@ -1197,6 +1364,7 @@ function finishSending(s: AppState, now: number, ok: boolean, at?: string): AppS
           msgIndex: scr.msgIndex,
           messageId: scr.messageId,
           reply: scr.reply,
+          mode: scr.mode,
         },
       }
     }
@@ -1225,7 +1393,7 @@ function finishSending(s: AppState, now: number, ok: boolean, at?: string): AppS
       ? markAllRead(s, scr.chatId)
       : markUpToMessage(s, scr.chatId, scr.messageId)
 
-  if (scr.mode === 'reply') {
+  if (scr.mode === 'reply' || scr.mode === 'voice') {
     const when = at ? new Date(at) : new Date(now)
     // The person travels with the receipt: after the reply the feed is
     // refreshed and this chat may already be gone from it.
@@ -1238,6 +1406,7 @@ function finishSending(s: AppState, now: number, ok: boolean, at?: string): AppS
         reply: scr.reply,
         at: timeStr(Number.isNaN(when.getTime()) ? new Date(now) : when),
         person,
+        ...(scr.mode === 'voice' ? { voice: true } : {}),
       },
     }
   }

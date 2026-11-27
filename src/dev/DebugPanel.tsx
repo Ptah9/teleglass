@@ -94,7 +94,6 @@ export function DebugPanel({
             <div className="btns demo">
               <button type="button" onClick={menu(1)}>{t('dev.lang')}</button>
               <button type="button" onClick={menu(2)}>{t('dev.backend')}</button>
-              <button type="button" onClick={menu(3)}>{t('dev.mic')}</button>
               <button type="button" onClick={menu(4)}>{t('dev.telegram')}</button>
               <button type="button" onClick={menu(5)}>{t('dev.read')}</button>
             </div>

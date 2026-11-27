@@ -17,10 +17,10 @@ import { useToast } from './useToast'
 import { ChatsIcon, CloseIcon, SearchIcon } from './icons'
 
 /**
- * T1 вЂ” which chats the glasses show (ux-webview.md В§3). Every state from the
+ * T1 — which chats the glasses show (ux-webview.md §3). Every state from the
  * spec is here: loading skeleton, empty, error + Retry, nothing selected,
  * N selected. The row is one control (`role="checkbox"`), the box is only its
- * picture вЂ” no nested buttons, so a tap never lands on the wrong target.
+ * picture — no nested buttons, so a tap never lands on the wrong target.
  */
 
 type Load = 'loading' | 'ready' | 'error'

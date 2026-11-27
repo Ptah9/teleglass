@@ -19,7 +19,7 @@ import {
   type EvenHubEvent,
   type LaunchSource,
 } from '@evenrealities/even_hub_sdk'
-import type { AppEvent, AudioSource, Gesture, Lang } from '../state/types'
+import type { AppEvent, Gesture, Lang } from '../state/types'
 import type { View, ViewList, ViewText } from '../view/build'
 
 /**
@@ -56,8 +56,16 @@ export interface GlassesTarget {
   /** Language persisted by the host; null when nothing is stored yet. */
   loadLang(): Promise<Lang | null>
   saveLang(lang: Lang): Promise<void>
-  /** Microphone on/off through the SDK; the level arrives as an AppEvent. */
-  audio(on: boolean, source: AudioSource): Promise<boolean>
+  /**
+   * The glasses microphone on/off through the SDK. Only
+   * `AudioInputSource.Glasses` is ever requested: the phone microphone is not
+   * used at all (Антон, 27.11), so the parameter is gone.
+   */
+  audio(on: boolean): Promise<boolean>
+  /** Raw PCM collected by `audio(true)` so far; returns a copy and clears. */
+  takePcm(): Uint8Array
+  /** Drop whatever was collected; called when a new recording starts. */
+  clearPcm(): void
 }
 
 /**
@@ -154,17 +162,31 @@ function nativeTarget(bridge: EvenAppBridge): GlassesTarget {
   let prevSig: string | null = null
   let prevTexts: Record<string, { content: string; level: number }> = {}
   let audioOn = false
+  /**
+   * The recording, chunk by chunk. 16 kHz mono 16-bit is 32 KB/s; the hard cap
+   * below is 120 s (task v0.7 §6). Kept here, next to the SDK: the reducer has
+   * no business holding megabytes, and the page takes the bytes once.
+   */
+  const PCM_CAP = 120 * 32_000
+  let pcmChunks: Uint8Array[] = []
+  let pcmBytes = 0
 
   const emit = (e: AppEvent) => {
     for (const l of [...listeners]) l(e)
   }
 
   bridge.onEvenHubEvent((ev: EvenHubEvent) => {
-    // Microphone: PCM 16 kHz, signed 16-bit little-endian, mono. The level is
-    // the RMS of the chunk; the transcript stays a mock until STT arrives.
+    // Microphone: PCM 16 kHz, signed 16-bit little-endian, mono. The level drives
+    // the indicator; the bytes are kept for recognition / a voice note.
     if (ev.audioEvent) {
       if (!audioOn) return
-      emit({ type: 'audio', level: levelOf(ev.audioEvent.audioPcm) })
+      const chunk = ev.audioEvent.audioPcm
+      if (chunk && pcmBytes < PCM_CAP) {
+        const copy = chunk instanceof Uint8Array ? chunk.slice() : Uint8Array.from(chunk)
+        pcmChunks.push(copy)
+        pcmBytes += copy.byteLength
+      }
+      emit({ type: 'audio', level: levelOf(chunk ?? new Uint8Array()) })
       return
     }
 
@@ -405,16 +427,13 @@ function nativeTarget(bridge: EvenAppBridge): GlassesTarget {
         console.warn('[teleglass] setLocalStorage failed:', err)
       }
     },
-    async audio(on, source) {
+    async audio(on) {
       try {
-        const ok = await bridge.audioControl(
-          on,
-          source === 'phone' ? AudioInputSource.Phone : AudioInputSource.Glasses,
-        )
-        // The host answers false when the capture did not start: the page then
-        // falls back to the other microphone instead of showing a flat line.
+        const ok = await bridge.audioControl(on, AudioInputSource.Glasses)
+        // The host answers false when the capture did not start: the page ends
+        // the recording with an honest "did not catch it" (no phone fallback).
         audioOn = on && ok
-        if (!ok) console.warn('[teleglass] audioControl → false:', on, source)
+        if (!ok) console.warn('[teleglass] audioControl → false:', on)
         return ok
       } catch (err) {
         // No permission or no capture on this host: the indicator stays flat.
@@ -422,6 +441,22 @@ function nativeTarget(bridge: EvenAppBridge): GlassesTarget {
         audioOn = false
         return false
       }
+    },
+    takePcm() {
+      if (pcmBytes === 0) return new Uint8Array()
+      const out = new Uint8Array(pcmBytes)
+      let offset = 0
+      for (const chunk of pcmChunks) {
+        out.set(chunk, offset)
+        offset += chunk.byteLength
+      }
+      pcmChunks = []
+      pcmBytes = 0
+      return out
+    },
+    clearPcm() {
+      pcmChunks = []
+      pcmBytes = 0
     },
   }
 }
@@ -478,8 +513,15 @@ function browserTarget(): GlassesTarget {
     },
     async audio() {
       // No glasses microphone outside Even App: the preview drives LISTENING by
-      // hand, and a "refused" answer would send the demo to the phone variant.
+      // hand, and a "refused" answer would turn it into HEARD "did not catch it".
       return true
+    },
+    takePcm() {
+      // No PCM in a browser: the page keeps the labelled demo transcript.
+      return new Uint8Array()
+    },
+    clearPcm() {
+      /* nothing is collected outside Even App */
     },
   }
 }
@@ -496,6 +538,12 @@ function browserTarget(): GlassesTarget {
 export async function createTarget(): Promise<GlassesTarget> {
   if (typeof window !== 'undefined') {
     const inEvenApp = 'flutter_inappwebview' in window
+    // The browser debug panel is a preview, not a host: the SDK would answer
+    // with its stub bridge, whose `audioControl` is always false, so the voice
+    // screens could not be demoed at all. Inside Even App (`?dev=1` is the
+    // backup remote there) the real bridge is still used.
+    const params = new URLSearchParams(window.location.search)
+    if (!inEvenApp && (params.has('dev') || params.has('panel'))) return browserTarget()
     const probe = inEvenApp
       ? waitForEvenAppBridge().catch(() => null)
       : Promise.race([

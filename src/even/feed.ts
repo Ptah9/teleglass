@@ -138,6 +138,7 @@ function toMessage(chatId: string, message: MessageSummary): MockMessage {
     // Reply options are the LLM's job (v0.5): an empty list means "not asked
     // yet"; the page opens REPLIES with a skeleton and a real request.
     replies: [],
+    ...(message.voice === true ? { voice: true } : {}),
   }
 }
 

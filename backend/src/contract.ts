@@ -18,6 +18,7 @@ export type AuthErrorCode =
   | 'linkExpired'
   | 'llm'
   | 'send'
+  | 'stt'
   | 'unknown'
 
 /** `types.ts` `AuthState`. `token` travels only when a login just completed. */
@@ -60,6 +61,11 @@ export interface MessageSummary {
    * The LLM language rule needs it: a media word is not a language.
    */
   media?: boolean
+  /**
+   * A Telegram voice note (an audio file marked `voice`, not any audio). The
+   * page asks for its transcript when the message is opened (v0.7 §5).
+   */
+  voice?: boolean
 }
 
 /** What the LLM returns for one message (v0.5). */
@@ -94,6 +100,15 @@ export interface LinkState {
   token?: string
 }
 
+/** What the WebView sends to `/stt`: raw glasses PCM or a ready WAV. */
+export type AudioFormat = 'wav' | 'pcm'
+
+export interface Transcript {
+  text: string
+  /** Audio length the provider actually saw; logged, used for the 120 s cap. */
+  durationMs: number
+}
+
 /**
  * A failure the phone can name. `status` is picked here, not by `Error`
  * guessing: the WebView only looks at `error` in the body.
@@ -120,6 +135,7 @@ export function isAuthErrorCode(value: unknown): value is AuthErrorCode {
     value === 'linkExpired' ||
     value === 'llm' ||
     value === 'send' ||
+    value === 'stt' ||
     value === 'unknown'
   )
 }

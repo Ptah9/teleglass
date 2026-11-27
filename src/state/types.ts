@@ -29,16 +29,9 @@ export type AppEvent =
   | { type: 'listClick'; index: number }
   /** Context menu item (v0.1 demo levers: language, backend, microphone, Telegram). */
   | { type: 'menu'; item: number }
-  /**
-   * Microphone level 0…1 from one SDK audio chunk, while LISTENING is open.
-   * The source is decided by the page (lever, refusal, 2 s of silence) and
-   * reported by `micSource`: one owner for the microphone state machine.
-   */
+  /** Microphone level 0…1 from one SDK audio chunk, while LISTENING is open. */
   | { type: 'audio'; level: number }
-  /** The page switched the microphone; LISTENING shows which one is live. */
-  | { type: 'micSource'; source: AudioSource }
-  /**
-   * The page came back to the foreground (docs: background-lifecycle.md).
+  /** The page came back to the foreground (docs: background-lifecycle.md).
    * Audio capture stops while the WebView is suspended, so it is re-armed here.
    */
   | { type: 'foreground' }
@@ -77,11 +70,30 @@ export type AppEvent =
       gone?: boolean
     }
   /**
+   * The voice recording turned out to be empty (the microphone answered but no
+   * PCM arrived). Nothing was uploaded: SENDING goes back to the options.
+   */
+  | { type: 'voiceEmpty' }
+  /**
    * A read mark did not reach Telegram (network, 502): the message is still
    * unread there, so the glasses must stop hiding it. With `messageId`, only
    * what that mark would have covered is brought back.
    */
   | { type: 'unread'; chatId: string; messageId?: string }
+  /**
+   * The recognizer answered (or refused) the recording made for HEARD. `attempt`
+   * is the recording's start time: a late answer for an older attempt must not
+   * replace the text of a newer one.
+   */
+  | {
+      type: 'heardResult'
+      chatId: string
+      attempt: number
+      ok: boolean
+      text: string
+    }
+  /** A transcript arrived for an incoming voice message of the feed. */
+  | { type: 'incomingTranscript'; chatId: string; messageId: string; ok: boolean; text: string }
   | { type: 'tick'; now: number }
 
 /** Message from Telegram. A mock in v0.1; the summary field appears when the text is long. */
@@ -97,6 +109,10 @@ export interface MockMessage {
   remoteId?: string
   /** The LLM already answered (possibly with nothing). `true` = no retry loop. */
   repliesReady?: boolean
+  /** A voice note: the page asks the backend for its transcript once. */
+  voice?: boolean
+  /** One transcript attempt is over (success or failure); do not ask again. */
+  transcript?: 'done' | 'failed'
 }
 
 export interface MockChat {
@@ -106,8 +122,6 @@ export interface MockChat {
   messages: MockMessage[]
 }
 
-export type AudioSource = 'glasses' | 'phone'
-
 /**
  * Where the chat list came from. `demo` is the labelled demo set, `loading` and
  * `error` are the honest "not in Telegram yet" states — a connected account must
@@ -115,8 +129,13 @@ export type AudioSource = 'glasses' | 'phone'
  */
 export type FeedStatus = 'demo' | 'loading' | 'ready' | 'error'
 
-/** HEARD states: recognized text, "did not catch it", "phone microphone". */
-export type HeardVariant = 'ok' | 'error' | 'phoneMic'
+/**
+ * HEARD variants: recognized text and "did not catch it". The moment between
+ * the recording and the text lives on LISTENING (`phase: 'recognizing'`), so
+ * the screen never goes blank. The phone microphone is never used
+ * (Антон, 27.11): there is no `phoneMic` state any more.
+ */
+export type HeardVariant = 'ok' | 'error'
 
 export type Screen =
   | { kind: 'chats' }
@@ -135,8 +154,6 @@ export type Screen =
       reply: string
       /** "No" goes back where the reply came from: the options or the transcript. */
       from: 'replies' | 'heard'
-      /** Which HEARD the transcript came from, so "no" restores the same caption. */
-      heardVariant?: 'ok' | 'phoneMic'
     }
   | { kind: 'quickConfirm'; chatId: string }
   | {
@@ -158,10 +175,19 @@ export type Screen =
        */
       messageId: string
       reply: string
-      mode: 'reply' | 'quick'
+      /** `voice` sends the recording from HEARD as a voice note, no text. */
+      mode: 'reply' | 'quick' | 'voice'
       startAt: number
     }
-  | { kind: 'sent'; chatId: string; reply: string; at: string; person?: string }
+  | {
+      kind: 'sent'
+      chatId: string
+      reply: string
+      at: string
+      person?: string
+      /** The receipt is for a voice note: the body is a word, not the text. */
+      voice?: boolean
+    }
   | {
       kind: 'offline'
       chatId: string
@@ -169,17 +195,29 @@ export type Screen =
       /** The same anchor the failed attempt used: the retry must not pick a new one. */
       messageId: string
       reply: string
+      /** A failed voice note retries the same recording, not an empty text. */
+      mode: 'reply' | 'voice'
     }
   | {
       kind: 'listening'
       chatId: string
       msgIndex: number
       mode: 'hold' | 'tap'
-      /** Which microphone records right now; the phone one is the fallback. */
-      source: AudioSource
+      /**
+       * What the recording is for: a dictated reply (`text`, recognized and sent
+       * through SEND?) or a Telegram voice note (`voice`, sent as recorded, no
+       * recognition). Two entries in REPLIES map to these outcomes.
+       */
+      outcome: 'text' | 'voice'
       startAt: number
       /** Recent microphone levels (0…1), one per SDK audio chunk (100 ms). */
       levels: number[]
+      /**
+       * Set when dictation stopped and whisper is working. The microphone is
+       * closed, the footer says "recognizing…", and no gesture does anything
+       * until the text (or its absence) arrives (task v0.7 §6).
+       */
+      phase?: 'recognizing'
     }
   | {
       kind: 'heard'
@@ -212,8 +250,6 @@ export interface AppState {
   selectedChats: string[] | null
   /** Demo lever: "backend not responding". Toggled from the context menu. */
   backendDown: boolean
-  /** Demo lever: force the phone microphone instead of the glasses one. */
-  phoneMic: boolean
   /**
    * Telegram account link state. The setup screen appears when it is false
    * (ux-flow.md inventory: «CHATS — Telegram не подключён»); in v0.1 it is a

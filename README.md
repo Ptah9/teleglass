@@ -5,25 +5,37 @@ pick with a gesture → confirm → send. One WebView serves both surfaces: the
 phone (login and settings) and the glasses (a render target driven by Even Hub
 containers).
 
-**v0.6.0 — replies go out, read marks stick.** The phone signs in to Telegram
-through the backend (MTProto, no Bot API stand-in), the glasses list is the
-account's unread dialogs with their real messages, opening a message fetches a
-real summary and three reply options, and the chosen reply is sent to Telegram
-from the glasses: `SENT` is Telegram's own message id and time, `SKIP?` marks up
-to that message read, and viewing a chat marks nothing. Still mock: the demo set
-used before a link exists (`src/api/demo.ts`).
+**v0.7.0 — voice.** The glasses microphone records, whisper.cpp on our backend
+turns the recording into text, and the text goes out through `SEND?` like a typed
+reply. The same recording can go out as a Telegram voice note (swipe ↑ on
+`HEARD`), and an incoming voice message opens as its transcript. Recognition is
+local: no audio leaves the machine, and one voice message is recognized once.
+The phone microphone is not used at all.
 
 What is real in this version:
 
 - the glasses list is live: unread dialogs from Telegram with their real texts
   and times, `1/N` pages through the unread messages of a chat, and the list
   refreshes on start and when the WebView comes back to the foreground;
+- a recording made on the glasses is recognized by whisper.cpp (16 kHz PCM →
+  WAV → `/stt`), `HEARD` shows the text, and a tap sends it through `SEND?`;
+- an incoming voice message is transcribed on open (Telegram download → ffmpeg →
+  whisper) and cached in SQLite by `chatId + messageId`;
+- swipe ↑ on `HEARD` uploads the same recording as a voice note: PCM → ffmpeg →
+  Ogg Opus 48 kHz mono ~24 kbps → `messages.sendMedia` with the voice attribute;
+  the temp file is removed after the upload, and the note has its own stable
+  `random_id` — the text one would be deduplicated by Telegram into the text
+  message sent from the same pair;
+- the reply options screen now ends with three actions: `Say it (text)` (dictate,
+  recognize, send through `SEND?`), `Say it (voice message)` (record and send the
+  note as is, no recognition) and `Just read` (mark up to the message read and go
+  back to the chats). Six rows live in the native 4-row list and scroll;
 - phone sign-in (number + code + 2FA), disconnect and delete-all run against
   the backend; the session and the keys stay there, the WebView holds only a
   bearer token;
 - the backend speaks MTProto through `teleproto`: `GET /chats`,
   `GET /chats/:id/messages`, `POST /chats/:id/send`, `POST /chats/:id/read`,
-  sessions in SQLite under `backend/data/`;
+  `POST /chats/:id/voice`, sessions in SQLite under `backend/data/`;
 - a reply picked on the glasses is sent for real: `SENT` carries Telegram's
   message id and time, a retry reuses `random_id` so it cannot become a second
   message, and a refusal is an honest `OFFLINE` with a retry, never a fake
@@ -128,7 +140,7 @@ instead of a button near the top, and selected chat rows have a gap between them
 
 ## Backend API
 
-The WebView never talks to Telegram. The backend owns MTProto (GramJS), the
+The WebView never talks to Telegram. The backend owns MTProto (teleproto), the
 Telegram session and the LLM keys. The contract is `src/api/types.ts`; the HTTP
 implementation is `src/api/client.ts`.
 
@@ -144,8 +156,11 @@ implementation is `src/api/client.ts`.
 | `POST` | `/api/auth/logout` | drop the Telegram session |
 | `DELETE` | `/api/data` | remove the session and stored data |
 | `GET` | `/api/chats` | `[{ id, title, preview, unread }]` for T1 and the glasses feed |
-| `GET` | `/api/chats/:id/messages` | last messages of one dialog, oldest first: `[{ id, at, text, out, media? }]` |
+| `GET` | `/api/chats/:id/messages` | last messages of one dialog, oldest first: `[{ id, at, text, out, media?, voice? }]`; `voice: true` marks a voice note to transcribe |
 | `POST` | `/api/chats/:id/send` | `{ messageId, text }` → `{ id, at }`; `random_id` comes from the pair, so a retry does not duplicate; a refusal is 502 `{ error: "send" }` |
+| `POST` | `/api/chats/:id/voice` | `{ messageId, audio }` (base64 PCM) → `{ id, at }`, a voice note; its own stable `random_id` from the pair (the text one collides); a refusal is 502 `{ error: "send" }` |
+| `POST` | `/api/chats/:id/messages/:messageId/transcribe` | transcript of an incoming voice message, cached by chat + message: `{ text }` |
+| `POST` | `/api/stt` | `{ audio, format: "pcm" \| "wav" }` → `{ text, durationMs }`; a dead whisper, an empty transcript or no model is 502 `{ error: "stt" }` |
 | `POST` | `/api/chats/:id/read` | `{ messageId }` marks one message (and older) read, `{}` marks the chat; both 204 and idempotent |
 | `PUT` | `/api/settings` | mirror `{ lang, quickReply, tone, selectedChats, llmModel }` for the LLM |
 | `POST` | `/api/llm/key` | `{ apiKey }` — the backend stores the key; the WebView never keeps it |
@@ -154,7 +169,7 @@ implementation is `src/api/client.ts`.
 
 The session token comes back as `token` and is kept in `localStorage` under
 `teleglass.token`; it goes to our backend only, never to Telegram. Errors are
-`{ "error": "wrongCode" | "expiredCode" | "tooMany" | "wrongPassword" | "send" | ... }`.
+`{ "error": "wrongCode" | "expiredCode" | "tooMany" | "wrongPassword" | "send" | "stt" | ... }`.
 
 The LLM API key is one-way: it goes to the backend through `/api/llm/key`, the
 field is cleared immediately, and nothing about the key lands in `localStorage`.
@@ -192,30 +207,102 @@ nothing leaves the phone, and the sign-in code is printed on screen.
   tabs without the fake sign-in, for screenshots and quick checks);
 - `?demo` (bare) forces demo mode even when a backend answers.
 
+## Speech to text (whisper.cpp)
+
+Recognition runs locally: the glasses send raw microphone PCM to our backend,
+the backend talks to a whisper.cpp server on `127.0.0.1:8081`. No audio leaves
+the machine. Binaries and the model live in `backend/vendor/whisper/` and are
+**not in git** (`.gitignore`), so a fresh clone has to install them:
+
+1. **Binaries** — an official `whisper.cpp` Windows x64 build
+   (`whisper-bin-x64.zip`) from
+   <https://github.com/ggml-org/whisper.cpp/releases>. The binaries in `vendor/`
+   report `whisper.cpp version: 1.9.6`. Unpack it so that
+   `backend/vendor/whisper/Release/whisper-server.exe` and the DLLs next to it
+   exist.
+2. **Model** — `ggml-small.bin` (465 MB) from
+   <https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin>
+   (the file is in the `ggerganov/whisper.cpp` repository). Put it at
+   `backend/vendor/whisper/ggml-small.bin`. `medium` was measured and rejected:
+   three times slower on the same phrase, no better text.
+3. **ffmpeg** must be in `PATH` (``ffmpeg -version``). It converts Telegram's
+   Ogg/Opus into WAV for recognition and the glasses' PCM into an Ogg/Opus voice
+   note. Nothing is installed by npm.
+4. **Start the server** before the backend (it keeps the model in memory; the
+   CLI reloads it on every call and costs 3–4 s per phrase):
+
+   ```bash
+   cd backend/vendor/whisper/Release
+   ./whisper-server.exe -m ../ggml-small.bin -t 8 --host 127.0.0.1 --port 8081
+   ```
+
+5. **Backend settings** (optional, the defaults are the paths above):
+
+   ```
+   WHISPER_URL=http://127.0.0.1:8081
+   WHISPER_MODEL=./vendor/whisper/ggml-small.bin
+   ```
+
+If the model is missing the backend logs `stt.modelMissing` and answers
+`502 {"error":"stt"}`; if the server is not running — `stt.unavailable` and the
+same `502`. The backend never crashes because of speech, and the glasses show
+`HEARD — Didn't catch that.` instead of an empty screen. A transcript is never
+logged; the logs carry milliseconds, audio seconds and `cached: true/false`.
+
+Measured on this machine (Core Ultra 7 258V, 8 threads, `ggml-small.bin`):
+Russian 12.8 s → 2.61 s, Russian 3.3 s → 2.14 s, English 8.6 s → 2.30 s. On a
+loaded desktop the same phrases took 5.2–6.3 s, so the recognition budget scales
+with the recording (12–25 s) and the screen waits with `Recognizing…` instead of
+pretending to be stuck.
+
 ## Context menu (glasses demo levers)
 
 A long press of the glasses' system menu opens the v0.1 levers — they are
-mirrored by buttons on the `?dev=1` panel: language, backend down, microphone
-source, Telegram connected, "phone read the chat". All of them are demo-only and
-are removed before release, together with the `demo.*` keys.
+mirrored by buttons on the `?dev=1` panel: language, backend down, Telegram
+connected, "phone read the chat". All of them are demo-only and are removed
+before release, together with the `demo.*` keys.
 
-## Voice: real microphone, mock transcript
+## Voice
 
-`LISTENING` opens the microphone with the official `audioControl` and draws the
-level of the incoming PCM chunks (16 kHz, signed 16-bit LE, mono) as the
-official block ramp `▁▂▃▄▅▆▇█`; it closes the microphone on exit. The transcript
-is still a mock constant: no audio leaves the glasses.
+`LISTENING` opens the **glasses** microphone with the official `audioControl`
+(only `AudioInputSource.Glasses`: the phone microphone is never requested) and
+draws the level of the incoming PCM chunks (16 kHz, signed 16-bit LE, mono) as
+the official block ramp `▁▂▃▄▅▆▇█`. The recording stops when the finger is lifted,
+after 2 s of silence, or at 45 s for dictation (120 s for a voice note).
 
-The hackathon rules say "Bring your own speech-to-text — the SDK gives you raw
-microphone audio: send it to your own server (e.g. Whisper)", so recognition
-will run on our backend with Whisper.
+- After a dictation the screen stays `LISTENING`: the microphone is closed, the
+  frozen wave stays, and the footer says `recognizing…` (2–6 s). A blank screen
+  is not an option; no gesture works until the answer arrives. Then `HEARD`
+  shows the text: `tap` sends it through `SEND?`; `hold` records again;
+  `swipe ↑` sends the same recording as a Telegram voice note. A long transcript
+  scrolls with the firmware's own swipe, so there the swipe is a scroll and the
+  footer says so.
+- `REPLIES` lists the three LLM options, then `Say it (text)`, `Say it (voice
+  message)` and `Just read`. The voice entry records and sends the note without
+  recognition; a recording under 0.8 s returns to the options. `Just read` marks
+  the message read (up to it, as `SKIP?` does) and goes back to the chats.
+- `NO REPLIES` keeps the voice reachable: `swipe ↓` starts a dictation without
+  asking the model, so a failed LLM or a missing key does not take voice away.
+- Didn't catch it: `swipe ↑` still sends the recording as a voice note,
+  `hold` records again, `tap` goes back to the replies.
+- The 2 s silence stop belongs to dictation only: a pause inside a voice message
+  is part of it, so there the recording ends on the tap (or at 120 s).
+- An incoming voice message is transcribed in the background as soon as it
+  appears in the feed (three at a time), so CHAT already shows the words when the
+  message is opened; the header marks the text as a transcript (`· ГС` / `· voice`).
+  The second opening is read from the SQLite cache, not recognized again. The
+  reply options for a voice message are built from that transcript, never from
+  the word `Voice message`, and the LLM is never allowed to fetch or recognize
+  audio itself.
+- The recording goes out as Ogg Opus (mono 48 kHz, ~24 kbps, voice profile).
+  The temporary file lives in the system temp directory and is removed after the
+  upload.
 
 ## What's next
 
-- backend: MTProto (GramJS), LLM summary and three options, STT; then replace
-  `src/api/demo.ts` with the real API, no screen changes;
 - hardware checks: Cyrillic, line height, borders, the divider, the keyboard over
-  the sign-in form, WebView suspension during link login;
+  the sign-in form, WebView suspension during link login, the glasses microphone
+  level and the 2 s silence stop on real G2;
 - remove the demo levers and the `demo.*` keys before submission.
 
 The spec and the screen map live in the team repository's `specs/` folder

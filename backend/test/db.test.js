@@ -18,6 +18,10 @@ test('sessions, tokens and single-account replacement', () => {
     assert.equal(db.getSession('s1')?.user_id, '42')
     assert.equal(db.sessionIdByTokenHash('hash1'), 's1')
 
+    // The cache holds other people's words: a new account must not inherit them.
+    db.putSttCache('user:1', '10', 'hello there', 1, 1)
+    assert.equal(db.getSttCache('user:1', '10')?.text, 'hello there')
+
     db.saveSession({
       id: 's2',
       user_id: '43',
@@ -30,10 +34,13 @@ test('sessions, tokens and single-account replacement', () => {
     assert.equal(db.getSession('s1'), null)
     assert.equal(db.sessionIdByTokenHash('hash1'), null)
     assert.equal(db.getSession('s2')?.user_id, '43')
+    assert.equal(db.getSttCache('user:1', '10'), null)
 
+    db.putSttCache('user:43', '11', 'second account', 1, 2)
     db.deleteSession('s2')
     assert.equal(db.getSession('s2'), null)
     assert.equal(db.sessionIdByTokenHash('hash1'), null)
+    assert.equal(db.getSttCache('user:43', '11'), null)
   } finally {
     db.close()
   }
@@ -119,6 +126,7 @@ test('wipeAll removes sessions, tokens, settings, llm key and pending', () => {
     )
     db.putLlmKey('v1:x:y:z', 1)
     db.putLlmCache('cache-key', 'short', ['a', 'b', 'c'], 1)
+    db.putSttCache('user:1', '10', 'words from a voice note', 1, 1)
     db.addFutureToken('token', 's1', 1)
     db.putPending({
       id: 'p1',
@@ -136,6 +144,7 @@ test('wipeAll removes sessions, tokens, settings, llm key and pending', () => {
 
     assert.equal(db.hasLlmKey(), false)
     assert.equal(db.getLlmCache('cache-key', 0), null)
+    assert.equal(db.getSttCache('user:1', '10'), null)
     assert.equal(db.getSession('s1'), null)
     assert.equal(db.sessionIdByTokenHash('hash'), null)
     assert.equal(db.countPending(), 0)

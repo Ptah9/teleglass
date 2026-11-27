@@ -156,13 +156,14 @@ const answer = JSON.stringify({
   replies: ['Да, давай в 18:00.', 'Не смогу сегодня.', 'Давай завтра?'],
 })
 
-function message(id, text, out = false, media) {
+function message(id, text, out = false, media, voice) {
   return {
     id: String(id),
     at: '2026-11-26T10:00:00.000Z',
     text,
     out,
     ...(media === undefined ? {} : { media }),
+    ...(voice === undefined ? {} : { voice }),
   }
 }
 
@@ -300,6 +301,35 @@ test('the context window keeps ten when the unread count is unknown', () => {
   assert.equal(contextWindow(1), 6)
   assert.equal(contextWindow(5), 10)
   assert.equal(contextWindow(20), 10)
+})
+
+test('a voice note is answered from its cached transcript, not from the label', async () => {
+  const client = clientOf([answer])
+  const messages = [message(1, 'Пойдём есть?'), message(2, 'Voice message', false, true, true)]
+  const s = setup({ messages, client })
+  try {
+    s.db.putSttCache('user:1', '2', 'Созвонимся в 19:00?', 3.2, Date.now())
+    await s.service.replies(TOKEN, 'user:1', '2')
+    const user = client.calls[0].messages[1].content
+    assert.match(user, /19:00/)
+    assert.doesNotMatch(user, /Voice message/)
+  } finally {
+    s.close()
+  }
+})
+
+test('an answer cached for the label is not served once the transcript exists', async () => {
+  const client = clientOf([answer])
+  const s = setup({ messages: [message(1, 'Voice message', false, true, true)], client })
+  try {
+    await s.service.replies(TOKEN, 'user:1', '1')
+    s.db.putSttCache('user:1', '1', 'Ты где?', 1.5, Date.now())
+    await s.service.replies(TOKEN, 'user:1', '1')
+    assert.equal(client.calls.length, 2)
+    assert.match(client.calls[1].messages[1].content, /Ты где\?/)
+  } finally {
+    s.close()
+  }
 })
 
 test('a bad answer is retried once, and a second failure is llm/badjson', async () => {

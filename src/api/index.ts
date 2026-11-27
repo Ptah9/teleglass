@@ -84,6 +84,11 @@ export const api: Api = {
   messages: async (chatId) => (await ready()).messages(chatId),
   sendReply: async (chatId, messageId, text) =>
     (await ready()).sendReply(chatId, messageId, text),
+  transcribe: async (audio, format) => (await ready()).transcribe(audio, format),
+  sendVoice: async (chatId, messageId, audio) =>
+    (await ready()).sendVoice(chatId, messageId, audio),
+  transcribeMessage: async (chatId, messageId) =>
+    (await ready()).transcribeMessage(chatId, messageId),
   markRead: async (chatId, messageId) => (await ready()).markRead(chatId, messageId),
   markChatRead: async (chatId) => (await ready()).markChatRead(chatId),
   putSettings: async (payload) => (await ready()).putSettings(payload),

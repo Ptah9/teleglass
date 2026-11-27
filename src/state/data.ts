@@ -193,10 +193,10 @@ export const MOCK_INBOX: { chatId: string; message: MockMessage }[] = [
 /** Default text for the quick reply (set in the WebView; a constant in v0.1). */
 export const MOCK_QUICK_REPLY = "I'll reply later, busy now."
 
-/** Recognition mock: a normal recording. */
+/** Browser preview only: there is no microphone outside Even App, so HEARD gets this text. */
 export const MOCK_HEARD_TEXT = 'Yes, 18:00 works, but only if we start on time.'
 
-/** Recognition mock: a long transcript, so the HEARD scrolling window is reachable. */
+/** Browser preview: a long transcript, so the HEARD scrolling window is reachable. */
 export const MOCK_HEARD_LONG =
   'So, about tomorrow: I can make the earlier slot, but I need to leave by seven. ' +
   'If we keep it short, thirty minutes at most, we can cover the plan and the numbers. ' +

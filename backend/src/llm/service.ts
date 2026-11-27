@@ -195,14 +195,27 @@ export class LlmService implements LlmApi {
 
     const index = messages.findIndex((message) => message.id === messageId)
     if (index < 0) throw new ContractError('unknown', 404)
-    const target = messages[index] as MessageSummary
+    // A voice note reaches us as the media word "Voice message". Its transcript
+    // is asked for by the CHAT screen before the options and cached by the STT
+    // service (task v0.7 §10: the screen first), so the options answer the spoken
+    // words instead of guessing from the neighbours. No cache — no transcription
+    // here: the LLM never downloads audio on its own.
+    const known = messages.map((message) => {
+      if (!message.voice) return message
+      const cachedText = this.db.getSttCache(chatId, message.id)?.text
+      return cachedText ? { ...message, text: cachedText, media: false } : message
+    })
+    const target = known[index] as MessageSummary
+    // The label and the transcript are different questions: an answer already
+    // cached for "Voice message" must not be served once the words are known.
+    const transcribed = target.text !== messages[index]?.text
 
-    const lang = langOf(messages, index, fallbackLang)
+    const lang = langOf(known, index, fallbackLang)
     // Telethon counts the unread block; §4 p.7 shrinks the transcript when it is
     // small (`unread + 5`), so a one-message chat does not pay for nine
     // unrelated lines.
     const unread = (await this.auth.unreadCount?.(token, chatId)) ?? 0
-    const transcript = messages.slice(
+    const transcript = known.slice(
       Math.max(0, index + 1 - contextWindow(unread)),
       index + 1,
     )
@@ -210,7 +223,8 @@ export class LlmService implements LlmApi {
     const prompt = promptMessages(lang, tone, long, transcript)
     const promptChars = prompt.reduce((sum, message) => sum + message.content.length, 0)
 
-    const cacheKey = cacheKeyOf(chatId, messageId, tone, model, lang)
+    const cacheKey =
+      cacheKeyOf(chatId, messageId, tone, model, lang) + (transcribed ? ':transcript' : '')
     const cached = this.db.getLlmCache(cacheKey, started - CACHE_TTL_MS)
     if (cached) {
       this.log.info('llm.request', {

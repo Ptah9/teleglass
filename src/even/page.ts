@@ -1,17 +1,19 @@
 import { makeT } from '../i18n'
 import { buildView, type View } from '../view/build'
 import { createTarget, type GlassesTarget, type MenuItem } from './adapter'
-import { anchorId, chatById, initialState, reduce, unreadMsgs, visibleChats } from '../state/reducer'
+import { anchorId, chatById, initialState, reduce, replyActionOf, unreadMsgs, visibleChats } from '../state/reducer'
+import { MOCK_HEARD_LONG, MOCK_HEARD_TEXT } from '../state/data'
 import type {
   AppEvent,
   AppState,
-  AudioSource,
   FeedStatus,
   Gesture,
   Lang,
   MockChat,
+  MockMessage,
 } from '../state/types'
 import * as LINES from '../state/limits'
+import { lineCount } from '../state/wrap'
 
 /**
  * Orchestrator: holds the state, runs the reducer, writes the picture to target.
@@ -99,6 +101,29 @@ export interface Page {
    * told. Viewing a chat never calls this — просмотр ≠ прочтение.
    */
   onMark(cb: ((chatId: string, messageId: string) => void) | null): void
+  /**
+   * The recording stopped and its PCM must be recognized. The page holds no
+   * network: the WebView sends the bytes and answers with `applyTranscript`.
+   * `attempt` names the recording (its start time).
+   */
+  onTranscript(cb: ((chatId: string, attempt: number, pcm: Uint8Array) => void) | null): void
+  /** The recognizer answered (or refused) for one recording. */
+  applyTranscript(chatId: string, attempt: number, result: { ok: boolean; text: string }): void
+  /** A voice message of the feed needs a transcript (once per message). */
+  onIncomingTranscript(cb: ((chatId: string, messageId: string) => void) | null): void
+  /** The transcript for an incoming voice message arrived, or did not. */
+  applyIncomingTranscript(
+    chatId: string,
+    messageId: string,
+    result: { ok: boolean; text: string },
+  ): void
+  /**
+   * HEARD → SENDING voice: the WebView uploads the same recording as a voice
+   * note. The page keeps the PCM of the last recording for exactly this.
+   */
+  onSendVoice(
+    cb: ((chatId: string, messageId: string, pcm: Uint8Array) => void) | null,
+  ): void
   subscribe(cb: (s: AppState) => void): () => void
   state(): AppState
   /** true — the page lives inside Even App (glasses), false — browser. */
@@ -130,10 +155,21 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     | null = null
   /** Set by the WebView: SKIP? marks the message read on Telegram. */
   let readHandler: ((chatId: string, messageId: string) => void) | null = null
+  /** Set by the WebView: it recognizes the recording (no STT in the page). */
+  let transcriptHandler: ((chatId: string, attempt: number, pcm: Uint8Array) => void) | null = null
+  /** Set by the WebView: it transcribes an incoming voice message. */
+  let incomingTranscriptHandler: ((chatId: string, messageId: string) => void) | null = null
+  /** Set by the WebView: it uploads the recording as a voice note. */
+  let voiceHandler: ((chatId: string, messageId: string, pcm: Uint8Array) => void) | null = null
   /** Requests already sent, so a tick does not ask twice for one message. */
   const repliesInFlight = new Set<string>()
   /** Sends in flight, keyed by `chatId#messageId`: the clock must not resolve them. */
   const sendsInFlight = new Set<string>()
+  /** Voice messages whose transcript was already asked for. */
+  const transcriptsInFlight = new Set<string>()
+  /** The last recording: HEARD can send it as a voice note (task v0.7 §7). */
+  let lastPcm: Uint8Array | null = null
+  let lastRecordMs = 0
 
   function menuItems(): MenuItem[] {
     const t = makeT(s.lang)
@@ -143,12 +179,6 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
         id: 2,
         name: t('demo.backend', {
           value: t(s.backendDown ? 'demo.value.down' : 'demo.value.up'),
-        }),
-      },
-      {
-        id: 3,
-        name: t('demo.mic', {
-          value: t(s.phoneMic ? 'demo.value.phone' : 'demo.value.glasses'),
         }),
       },
       {
@@ -190,82 +220,75 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   }
 
   /**
-   * The microphone is one resource with one owner: this page. The screen only
-   * says which source it believes in; the page opens it, watches for silence
-   * and falls back to the phone microphone when the glasses give nothing.
+   * The microphone is one resource with one owner: this page. Only the glasses
+   * microphone exists in this product (Антон, 27.11): a refusal ends the
+   * recording with an honest "did not catch it", it does not switch devices.
    */
   let micSeq = 0
-  let micTimer: number | null = null
-  /** A chunk arrived for the current attempt — the 2 s fallback is not needed. */
-  let micHeard = false
   let recordTimer: number | null = null
+  /** Wall-clock marks for the 2 s silence rule (task v0.7 §6). */
+  let lastChunkAt = 0
+  let lastSoundAt = 0
 
-  function clearMicTimer(): void {
-    if (micTimer !== null) {
-      window.clearTimeout(micTimer)
-      micTimer = null
-    }
-  }
-
-  function stopMic(source: AudioSource): void {
+  function stopMic(): void {
     micSeq++
-    clearMicTimer()
-    void target.audio(false, source)
+    void target.audio(false)
   }
 
   /**
-   * Open the microphone and arm the fallback. `seq` invalidates the answers of
-   * attempts that are already over: the user may leave LISTENING mid-call.
+   * Open the glasses microphone. `seq` invalidates the answers of attempts that
+   * are already over: the user may leave LISTENING mid-call.
    */
-  async function openMic(source: AudioSource): Promise<void> {
+  async function openMic(): Promise<void> {
     const seq = ++micSeq
-    clearMicTimer()
-    micHeard = false
-
-    const ok = await target.audio(true, source)
+    // A re-arm after suspend must not inherit the pre-suspend silence clock.
+    lastChunkAt = Date.now()
+    lastSoundAt = lastChunkAt
+    const ok = await target.audio(true)
     if (seq !== micSeq || s.screen.kind !== 'listening') return
 
     if (!ok) {
-      // Refused (permission, or no capture on this host). The glasses one is the
-      // default, so its refusal is what the phone fallback exists for.
-      console.warn('[teleglass] microphone refused:', source)
-      if (source === 'glasses') {
-        void target.audio(false, 'glasses')
-        apply({ type: 'micSource', source: 'phone' })
+      // Refused (permission, or no capture on this host). There is no fallback
+      // microphone. A dictated reply ends on HEARD "did not catch it"; a voice
+      // note has nothing to send, so it returns to the options instead of
+      // posting a silent recording.
+      console.warn('[teleglass] microphone refused')
+      void target.audio(false)
+      if (s.screen.outcome === 'voice') {
+        apply({ type: 'gesture', gesture: 'swipeUp' })
+        return
       }
-      return
+      apply({
+        type: 'gesture',
+        gesture: s.screen.mode === 'hold' ? 'longPressRelease' : 'click',
+      })
     }
-
-    // No glasses in a browser: there is nothing to fall back from.
-    if (source !== 'glasses' || !target.native) return
-
-    micTimer = window.setTimeout(() => {
-      micTimer = null
-      if (seq !== micSeq || micHeard || s.screen.kind !== 'listening') return
-      // 2 s without a single chunk: the glasses are not recording. Take the
-      // phone microphone and say so in the footer (design-system.md §5.1).
-      console.warn('[teleglass] no audio in 2 s — switching to the phone microphone')
-      void target.audio(false, 'glasses')
-      apply({ type: 'micSource', source: 'phone' })
-    }, LINES.MIC_FALLBACK_MS)
   }
 
   /**
    * Hard cap on one recording: the hold is a press/release pair and the OS may
    * swallow the release (ux-flow.md § Что может не сойтись). The synthetic
-   * gesture is the same one the user would send.
+   * gesture is the same one the user would send. Dictation stops at 45 s so it
+   * fits the recognition budget; a voice note is sent as recorded and follows
+   * Telegram's own 120 s limit.
    */
   function armRecordWatchdog(): void {
     clearRecordWatchdog()
+    // A voice note is sent as is, so only the dictation cap has to fit the
+    // recognition budget; the note itself follows Telegram's limit.
+    const cap =
+      s.screen.kind === 'listening' && s.screen.outcome === 'voice'
+        ? LINES.MAX_VOICE_RECORD_MS
+        : LINES.MAX_RECORD_MS
     recordTimer = window.setTimeout(() => {
       recordTimer = null
       if (s.screen.kind !== 'listening') return
-      console.warn('[teleglass] recording stopped at the cap:', LINES.MAX_RECORD_MS, 'ms')
+      console.warn('[teleglass] recording stopped at the cap:', cap, 'ms')
       apply({
         type: 'gesture',
         gesture: s.screen.mode === 'hold' ? 'longPressRelease' : 'click',
       })
-    }, LINES.MAX_RECORD_MS)
+    }, cap)
   }
 
   function clearRecordWatchdog(): void {
@@ -286,17 +309,34 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
       console.log(`[teleglass] screen: ${prev.screen.kind} → ${s.screen.kind}`)
     }
 
-    // Microphone follows the LISTENING screen and the source it shows.
+    // Microphone follows the LISTENING screen. A new recording starts with an
+    // empty buffer; leaving the screen closes the capture but keeps the bytes
+    // until the page hands them over.
     if (s.screen.kind === 'listening') {
-      const prevSource = prev.screen.kind === 'listening' ? prev.screen.source : null
-      if (prevSource !== s.screen.source) {
-        if (prevSource !== null) stopMic(prevSource)
-        void openMic(s.screen.source)
+      if (prev.screen.kind !== 'listening') {
+        target.clearPcm()
+        void openMic()
+        armRecordWatchdog()
+      } else if (s.screen.phase === 'recognizing' && prev.screen.phase !== 'recognizing') {
+        // Dictation stopped, whisper takes over: the microphone closes, the
+        // footer says "recognizing…", and the PCM leaves the adapter once.
+        stopMic()
+        clearRecordWatchdog()
+        finishRecording(prev.screen)
       }
-      if (prev.screen.kind !== 'listening') armRecordWatchdog()
     } else if (prev.screen.kind === 'listening') {
-      stopMic(prev.screen.source)
+      stopMic()
       clearRecordWatchdog()
+      // Whatever the reducer decided (HEARD for a too-short tap, or SENDING a
+      // voice note), the bytes leave the adapter exactly once. Leaving the
+      // recognizing phase means the answer already arrived.
+      if (
+        prev.screen.phase !== 'recognizing' &&
+        (s.screen.kind === 'heard' ||
+          (s.screen.kind === 'sending' && s.screen.mode === 'voice'))
+      ) {
+        finishRecording(prev.screen)
+      }
     }
 
     // Language is a host preference: store it where a WebView restart cannot lose it.
@@ -306,6 +346,50 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     for (const l of [...listeners]) l(s)
     maybeRequestReplies()
     maybeRequestSend()
+    maybeRequestVoice()
+    maybeRequestIncomingTranscript()
+  }
+
+  /**
+   * The recording ended. In a browser there is no microphone, so HEARD keeps
+   * its labelled mock text (the demo rules: under a second is a failure, a long
+   * hold shows a long transcript so scrolling is reachable). On the glasses the
+   * PCM goes to the backend; an empty buffer is an honest failure.
+   */
+  function finishRecording(rec: Extract<AppState['screen'], { kind: 'listening' }>): void {
+    const pcm = target.takePcm()
+    // The watchdog stops a voice note at 120 s, but a chunk may still land
+    // between the timer and the stop. The backend rejects anything longer, so
+    // the payload is cut to the cap instead of losing the whole note to a 400.
+    const maxBytes = (LINES.MAX_VOICE_RECORD_MS / 1000) * 32_000
+    lastPcm = pcm.byteLength > maxBytes ? pcm.slice(0, maxBytes) : pcm
+    lastRecordMs = Math.max(0, Date.now() - rec.startAt)
+    const scr = s.screen
+    // Only a dictation that is waiting for whisper hands its PCM over. A voice
+    // note is uploaded by `maybeRequestVoice`; a short failed tap has nothing.
+    if (scr.kind !== 'listening' || scr.phase !== 'recognizing') return
+    const attempt = scr.startAt
+
+    const resolve = (ok: boolean, text: string): void => {
+      publish(reduce(s, { type: 'heardResult', chatId: scr.chatId, attempt, ok, text }))
+    }
+
+    if (!target.native) {
+      resolve(true, lastRecordMs > 4_000 ? MOCK_HEARD_LONG : MOCK_HEARD_TEXT)
+      return
+    }
+    if (pcm.byteLength < 3_200) {
+      // Less than 0.1 s: nothing to recognize (refused capture, dead mic).
+      console.warn('[teleglass] recording is empty')
+      resolve(false, '')
+      return
+    }
+    if (transcriptHandler === null) {
+      console.warn('[teleglass] recording was not sent: no recognizer')
+      resolve(false, '')
+      return
+    }
+    transcriptHandler(scr.chatId, attempt, pcm)
   }
 
   /**
@@ -326,6 +410,11 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     }
     const key = `${scr.chatId}#${msg.remoteId}`
     if (repliesInFlight.has(key)) return
+    // Options for a voice note must answer the spoken words, not the label
+    // "Voice message". The scan transcribes unread notes in the background and
+    // puts the message on screen first; while it has no verdict the skeleton
+    // waits. `failed` is a verdict too: then the label is all we have.
+    if (msg.voice && msg.transcript === undefined && incomingTranscriptHandler !== null) return
     repliesInFlight.add(key)
     replyHandler(scr.chatId, msg.remoteId)
   }
@@ -338,6 +427,9 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   function maybeRequestSend(): void {
     const scr = s.screen
     if (scr.kind !== 'sending') return
+    // A voice note is a different request (and a different payload): see
+    // `maybeRequestVoice`.
+    if (scr.mode === 'voice') return
     // The lever: no request leaves, and the clock turns SENDING into OFFLINE.
     if (s.backendDown) return
     const fail = (why: string): void => {
@@ -378,6 +470,88 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   }
 
   /**
+   * HEARD → SENDING (voice): the WebView uploads the recording. The page keeps
+   * the last PCM; without it there is nothing to retry, and the screen leaves
+   * SENDING the same way a gone message does.
+   */
+  function maybeRequestVoice(): void {
+    const scr = s.screen
+    if (scr.kind !== 'sending' || scr.mode !== 'voice') return
+    if (s.backendDown) return
+    const fail = (gone: boolean): void => {
+      console.warn('[teleglass] voice send was not attempted')
+      publish(
+        reduce(s, {
+          type: 'sendResult',
+          chatId: scr.chatId,
+          messageId: scr.messageId,
+          ok: false,
+          gone,
+        }),
+      )
+    }
+    if (!scr.messageId || voiceHandler === null) {
+      fail(true)
+      return
+    }
+    if (target.native && (!lastPcm || lastPcm.byteLength < 3_200)) {
+      // The microphone answered but delivered no PCM: nothing to upload. CHATS
+      // would look like a sent message, OFFLINE would retry the same empty
+      // file — the options are the only honest place.
+      console.warn('[teleglass] voice send was not attempted: no recording')
+      publish(reduce(s, { type: 'voiceEmpty' }))
+      return
+    }
+    const key = `${scr.chatId}#${scr.messageId}`
+    if (sendsInFlight.has(key)) return
+    sendsInFlight.add(key)
+    voiceHandler(scr.chatId, scr.messageId, lastPcm ?? new Uint8Array())
+  }
+
+  /**
+   * Incoming voice notes are transcribed as soon as the feed arrives, not when
+   * the message is opened: CHAT must show the words at once (owner's call,
+   * 27.11). Two at a time — whisper is one model on one machine, and a burst of
+   * notes would otherwise queue for a minute. One attempt per message: a
+   * failure leaves the media word and is retried only after the feed is
+   * reloaded.
+   */
+  function maybeRequestIncomingTranscript(): void {
+    const handler = incomingTranscriptHandler
+    if (handler === null) return
+    if (transcriptsInFlight.size >= LINES.TRANSCRIPTS_AT_ONCE) return
+
+    const ask = (chatId: string, msg: MockMessage): boolean => {
+      if (!msg.voice || msg.transcript || !msg.remoteId) return false
+      const key = `${chatId}#${msg.remoteId}`
+      if (transcriptsInFlight.has(key)) return false
+      transcriptsInFlight.add(key)
+      handler(chatId, msg.remoteId)
+      return true
+    }
+    const full = (): boolean => transcriptsInFlight.size >= LINES.TRANSCRIPTS_AT_ONCE
+
+    // The message on screen first: the reply options wait for its transcript,
+    // and two busy slots taken by other notes would stretch that wait.
+    const scr = s.screen
+    if (
+      scr.kind === 'chat' ||
+      scr.kind === 'fulltext' ||
+      scr.kind === 'replies' ||
+      scr.kind === 'repliesLoading'
+    ) {
+      const chat = chatById(s, scr.chatId)
+      const msg = chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
+      if (chat && msg && ask(chat.id, msg) && full()) return
+    }
+    for (const chat of s.chats) {
+      for (const msg of unreadMsgs(chat, s.read)) {
+        if (ask(chat.id, msg) && full()) return
+      }
+    }
+  }
+
+  /**
    * Microphone chunks arrive far faster than the screen refreshes. They change
    * only the indicator, so the state is updated on every chunk while the
    * framebuffer is refreshed at AUDIO_FPS — the same rate a person can read.
@@ -385,7 +559,11 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
   let lastAudioRender = 0
 
   function applyAudio(e: AppEvent): void {
-    if (s.screen.kind === 'listening') micHeard = true
+    if (s.screen.kind === 'listening' && s.screen.phase !== 'recognizing') {
+      const now = Date.now()
+      lastChunkAt = now
+      if (e.type === 'audio' && e.level >= LINES.SILENCE_LEVEL) lastSoundAt = now
+    }
     const next = reduce(s, e)
     if (next === s) return
     s = next
@@ -452,6 +630,17 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
       return
     }
     if (g === 'swipeUp' || g === 'swipeDown') {
+      // HEARD promises "swipe ↑ — voice" only when the recording is still in
+      // hand. A long text uses the swipe for the firmware's own scroll, which
+      // the reducer already knows.
+      if (g === 'swipeUp' && s.screen.kind === 'heard') {
+        const scrolls =
+          s.screen.variant === 'ok' && lineCount(s.screen.text) > LINES.BODY_LINES
+        if (!scrolls && target.native && (!lastPcm || lastPcm.byteLength < 3_200)) {
+          console.warn('[teleglass] the swipe was ignored: no recording to send')
+          return
+        }
+      }
       const now = Date.now()
       if (now - lastSwipe < SWIPE_COOLDOWN) return
       lastSwipe = now
@@ -466,8 +655,24 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
         return
       case 'listClick':
         // Like a single tap: a double tap on the list must get a chance
-        // to cancel opening the item.
-        scheduleClick(() => apply(e))
+        // to cancel opening the item. "Just read" is a read mark, so it goes to
+        // the backend through the same handler as SKIP?; the reducer only keeps
+        // the local read map and moves the screen.
+        scheduleClick(() => {
+          const scr = s.screen
+          const chat = scr.kind === 'replies' ? chatById(s, scr.chatId) : null
+          const msg =
+            scr.kind === 'replies' && chat ? unreadMsgs(chat, s.read)[scr.msgIndex] : undefined
+          // The host sometimes reports no index (the reducer then uses the
+          // mirrored selection); the read mark must follow the same row.
+          const index = scr.kind === 'replies' ? (e.index >= 0 ? e.index : scr.sel) : -1
+          const action = msg ? replyActionOf(msg, index) : null
+          const messageId = msg ? anchorId(msg) : ''
+          apply(e)
+          if (scr.kind === 'replies' && action?.kind === 'read' && messageId) {
+            readHandler?.(scr.chatId, messageId)
+          }
+        })
         return
       case 'audio':
         applyAudio(e)
@@ -475,8 +680,9 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
       case 'foreground':
         apply(e)
         // Audio capture stops while the WebView is suspended
-        // (background-lifecycle.md): ask for the same source again.
-        if (s.screen.kind === 'listening') void openMic(s.screen.source)
+        // (background-lifecycle.md): ask for the glasses microphone again, but
+        // not while the page is waiting for whisper with the mic closed.
+        if (s.screen.kind === 'listening' && s.screen.phase !== 'recognizing') void openMic()
         // The glasses were off the head: unread may have arrived meanwhile.
         if (s.telegramConnected) refreshHandler?.()
         return
@@ -583,10 +789,82 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     readHandler = cb
   }
 
+  function onTranscript(cb: ((chatId: string, attempt: number, pcm: Uint8Array) => void) | null): void {
+    transcriptHandler = cb
+    // The recording may already be on screen waiting (the handler arrived late).
+    if (cb !== null && s.screen.kind === 'listening' && s.screen.phase === 'recognizing') {
+      if (lastPcm) cb(s.screen.chatId, s.screen.startAt, lastPcm)
+    }
+  }
+
+  function applyTranscript(
+    chatId: string,
+    attempt: number,
+    result: { ok: boolean; text: string },
+  ): void {
+    publish(
+      reduce(s, {
+        type: 'heardResult',
+        chatId,
+        attempt,
+        ok: result.ok,
+        text: result.text,
+      }),
+    )
+  }
+
+  function onIncomingTranscript(
+    cb: ((chatId: string, messageId: string) => void) | null,
+  ): void {
+    incomingTranscriptHandler = cb
+    if (cb !== null) maybeRequestIncomingTranscript()
+  }
+
+  function applyIncomingTranscript(
+    chatId: string,
+    messageId: string,
+    result: { ok: boolean; text: string },
+  ): void {
+    transcriptsInFlight.delete(`${chatId}#${messageId}`)
+    publish(reduce(s, { type: 'incomingTranscript', chatId, messageId, ...result }))
+  }
+
+  function onSendVoice(
+    cb: ((chatId: string, messageId: string, pcm: Uint8Array) => void) | null,
+  ): void {
+    voiceHandler = cb
+    if (cb !== null) maybeRequestVoice()
+  }
+
+  /**
+   * The 2 s silence rule (task v0.7 §6): recording stops when the wearer stops
+   * talking, not only when the finger lifts. A missing PCM stream counts as
+   * silence too — a dead capture must not record until the cap.
+   */
+  function checkSilence(): void {
+    if (s.screen.kind !== 'listening' || !target.native) return
+    // Whisper owns the screen now; the microphone is already closed.
+    if (s.screen.phase === 'recognizing') return
+    // A dictated reply ends on a pause: the thought is over. A voice note ends
+    // when the finger says so — a pause inside a spoken message is not its end.
+    if (s.screen.outcome === 'voice') return
+    const started = s.screen.startAt
+    const last = Math.max(started, lastChunkAt, lastSoundAt)
+    if (Date.now() - last < LINES.SILENCE_MS) return
+    console.warn('[teleglass] silence for', LINES.SILENCE_MS, 'ms — stopping the recording')
+    apply({
+      type: 'gesture',
+      gesture: s.screen.mode === 'hold' ? 'longPressRelease' : 'click',
+    })
+  }
+
   // First screen and ticks. StrictMode mounts components twice —
   // createPage is called once per page (see App.tsx).
   requestRender()
-  window.setInterval(() => apply({ type: 'tick', now: Date.now() }), TICK_MS)
+  window.setInterval(() => {
+    apply({ type: 'tick', now: Date.now() })
+    checkSilence()
+  }, TICK_MS)
 
   return {
     dispatch,
@@ -600,6 +878,11 @@ export function createPage(target: GlassesTarget, start: AppState = initialState
     applySend,
     applyUnread,
     onMark,
+    onTranscript,
+    applyTranscript,
+    onIncomingTranscript,
+    applyIncomingTranscript,
+    onSendVoice,
     subscribe(cb) {
       listeners.add(cb)
       return () => {

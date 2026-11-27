@@ -265,6 +265,38 @@ export function createDemoApi(options: DemoApiOptions = {}): Api {
       return { id: record.id, at: record.at }
     },
 
+    async transcribe(): Promise<never> {
+      // There is no recognizer behind the demo. The browser has no glasses
+      // microphone either, so HEARD keeps its labelled mock text; a real call
+      // here must fail honestly instead of inventing words.
+      await sleep(120)
+      throw new AuthError('stt')
+    },
+
+    async sendVoice(chatId: string, messageId: string): Promise<{ id: string; at: string }> {
+      await sleep(hasDemoFlag('send-error') ? 900 : 450)
+      if (hasDemoFlag('send-error')) throw new AuthError('send')
+      const chat = MOCK_CHATS.find((item) => item.id === chatId)
+      if (!chat) throw new AuthError('unknown', undefined, 404)
+      if (!chat.messages.some((message) => message.id === messageId)) {
+        throw new AuthError('unknown', undefined, 404)
+      }
+      demoSentSeq += 1
+      const record = {
+        chatId,
+        id: `demo-sent-${demoSentSeq}`,
+        at: new Date().toISOString(),
+        text: 'Voice message',
+      }
+      demoSent.push(record)
+      return { id: record.id, at: record.at }
+    },
+
+    async transcribeMessage(): Promise<never> {
+      await sleep(120)
+      throw new AuthError('stt')
+    },
+
     async markRead(chatId: string, messageId: string): Promise<void> {
       await sleep(80)
       const chat = MOCK_CHATS.find((item) => item.id === chatId)

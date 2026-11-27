@@ -30,6 +30,7 @@ const ERROR_KEY: Record<AuthErrorCode, Parameters<TFunc>[0]> = {
   llm: 'phone.auth.error.network',
   // Same for `send`: the glasses show OFFLINE, an auth form has no better line.
   send: 'phone.auth.error.network',
+  stt: 'phone.auth.error.network',
   unknown: 'phone.auth.error.network',
 }
 
